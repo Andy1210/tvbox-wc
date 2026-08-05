@@ -65,6 +65,14 @@ pub fn capture(
         .map_texture(&mapping)
         .map_err(|err| anyhow::anyhow!("failed to map the off-screen buffer: {err}"))?;
 
+    let non_zero = pixels.iter().filter(|byte| **byte != 0).count();
+    tracing::debug!(
+        bytes = pixels.len(),
+        non_zero,
+        first = ?&pixels[..16.min(pixels.len())],
+        "read the off-screen buffer"
+    );
+
     write_png(path, size.w, size.h, pixels)?;
     Ok((size.w, size.h))
 }

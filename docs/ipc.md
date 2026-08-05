@@ -96,12 +96,6 @@ What it captures is the scene, not the planes as the display engine composes the
 That is also what a capture protocol would hand a client. Whether the right thing
 is on the right plane is a question for the plane state, not for this.
 
-**Known gap:** a film and a translucent layer surface come out correctly, but an
-Electron window comes out empty even while the plane state shows its buffer being
-scanned out. Ruled out so far: the buffer is XB24 with a linear modifier, nothing is
-logged during the capture, and the same code path captures other clients. Until this
-is understood, read an empty capture as "unknown", not as "nothing on screen".
-
 ### Errors
 
 ```json

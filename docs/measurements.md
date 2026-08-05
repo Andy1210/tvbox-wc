@@ -148,6 +148,11 @@ client cannot allocate on is ignored wholesale.
 - **A test client must produce a dmabuf.** An shm buffer can never reach a KMS plane,
   so `tools/overlay.c` uses EGL/GLES2 - the same reason the real UI (Chromium) can be
   offloaded at all.
+- **Read a capture with a real PNG decoder.** A hand-rolled sampler that ignores
+  the per-row filters decodes a uniform image as all zeros, which reads exactly like
+  "the compositor rendered nothing". That cost a round: the capture was correct, the
+  reader was not. The compositor's own log of the read-back (`non_zero` and the
+  first bytes) settles it in one line.
 - **Check what the player actually got.** A streaming client can hand you 1080p when
   you asked for 4K, which looks identical to the offload breaking. Read
   `video-params/w` before attributing anything to the compositor.
