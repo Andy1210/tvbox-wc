@@ -212,7 +212,9 @@ impl Tvbox {
     /// The text input is offered the string first, because a client that speaks the
     /// protocol takes it whole and keeps its own idea of the caret. Whether it acts
     /// on that is out of our hands, so the keys go out either way; see docs/ipc.md.
-    pub fn type_text(&mut self, text: &str) -> anyhow::Result<usize> {
+    ///
+    /// `select_all` replaces the field's contents rather than appending to them.
+    pub fn type_text(&mut self, text: &str, select_all: bool) -> anyhow::Result<usize> {
         let text_input = self.seat.text_input();
         let mut offered = false;
         text_input.with_focused_text_input(|input, _surface| {
@@ -223,7 +225,7 @@ impl Tvbox {
             text_input.done(false);
         }
 
-        crate::typing::type_text(self, text)
+        crate::typing::type_text(self, text, select_all)
     }
 
     /// Render the scene to a PNG.

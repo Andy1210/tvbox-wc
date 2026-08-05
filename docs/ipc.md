@@ -83,15 +83,19 @@ including the ones that are not Electron.
 ### `type_text`
 
 ```json
-{"id": 7, "request": "type_text", "text": "arvizturo tukorfurogep"}
-{"id": 7, "ok": {"delivered": true}}
+{"id": 7, "request": "type_text", "text": "arvizturo tukorfurogep", "select_all": true}
+{"id": 7, "ok": {"keys": 22}}
 ```
 
 How the on-screen keyboard and a paired phone put text into a focused field. The
 alternative is synthesising key events, which needs an xkb keymap carrying every
 character in the string, generated per string.
 
-`delivered` says a client was there to take it, not that it appeared in the field.
+`keys` is how many key events went out, not proof that they landed in a field.
+
+`select_all` sends ctrl+a first, under the seat's own keymap. A caller replacing a
+field's contents wants it: the field usually already holds something - a prefilled
+address, the last search, the typo being corrected - and typing alone appends.
 
 The string is typed as real key events. A keycode only produces what the keymap
 says, and no ordinary layout carries every character a password or an accented

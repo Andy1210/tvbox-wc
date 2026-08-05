@@ -57,6 +57,9 @@ pub enum Request {
     TypeText {
         /// What to type.
         text: String,
+        /// Replace what the field already holds instead of appending to it.
+        #[serde(default)]
+        select_all: bool,
     },
     /// Render the scene to a PNG, for looking at the screen from a terminal.
     Screenshot {
@@ -300,8 +303,8 @@ fn dispatch(state: &mut Tvbox, request: Request) -> Result<serde_json::Value> {
             Ok(serde_json::Value::Null)
         }
         Request::GetState => Ok(serde_json::json!({ "focus": state.focus })),
-        Request::TypeText { text } => {
-            let keys = state.type_text(&text)?;
+        Request::TypeText { text, select_all } => {
+            let keys = state.type_text(&text, select_all)?;
             Ok(serde_json::json!({ "keys": keys }))
         }
         Request::Screenshot { path } => {

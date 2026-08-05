@@ -47,6 +47,11 @@ const RESERVED_EVDEV: &[u32] = &[
     158, // back, which the remote sends
 ];
 
+/// The select-all chord under the layout the seat normally carries: xkb counts
+/// keycodes from 8, so these are evdev 29 (left control) and 30 (a).
+const CTRL_KEYCODE: u32 = 37;
+const A_KEYCODE: u32 = 38;
+
 /// The keycodes a generated keymap may use.
 fn usable_keycodes() -> impl Iterator<Item = u32> {
     (FIRST_KEYCODE..=LAST_KEYCODE).filter(|code| !RESERVED_EVDEV.contains(&(code - 8)))
@@ -102,8 +107,31 @@ fn keymap_for(text: &str) -> Option<(String, Vec<Keycode>)> {
     Some((keymap, keys))
 }
 
+/// ctrl+a as press/release pairs.
+fn select_all_chord() -> Vec<(Keycode, bool)> {
+    vec![
+        (Keycode::from(CTRL_KEYCODE), true),
+        (Keycode::from(A_KEYCODE), true),
+        (Keycode::from(A_KEYCODE), false),
+        (Keycode::from(CTRL_KEYCODE), false),
+    ]
+}
+
+/// One press and one release per character, in order.
+fn strokes_for(keys: &[Keycode]) -> Vec<(Keycode, bool)> {
+    keys.iter()
+        .flat_map(|key| [(*key, true), (*key, false)])
+        .collect()
+}
+
 /// Type a string, then put the keyboard back the way it was.
-pub fn type_text(state: &mut Tvbox, text: &str) -> anyhow::Result<usize> {
+///
+/// `select_all` sends ctrl+a first, which is what a caller replacing a field's
+/// contents wants: the field usually already holds something (a prefilled address,
+/// the last search, the typo being corrected) and typing would append to it. It
+/// goes out under the seat's own keymap, before the generated one is loaded, since
+/// the generated keymap has no control key at all.
+pub fn type_text(state: &mut Tvbox, text: &str, select_all: bool) -> anyhow::Result<usize> {
     if text.is_empty() {
         return Ok(0);
     }
@@ -113,13 +141,17 @@ pub fn type_text(state: &mut Tvbox, text: &str) -> anyhow::Result<usize> {
     let (keymap, keys) = keymap_for(text)
         .ok_or_else(|| anyhow::anyhow!("the string needs too many distinct characters"))?;
 
+    if select_all {
+        send(state, &keyboard, &select_all_chord());
+    }
+
     keyboard
         .set_keymap_from_string(state, keymap)
         .map_err(|err| anyhow::anyhow!("failed to load the generated keymap: {err}"))?;
 
     // Wayland delivers a client's events in order, so the keymap is in place on the
     // client's side before these arrive.
-    send(state, &keyboard, &keys);
+    send(state, &keyboard, &strokes_for(&keys));
 
     keyboard
         .set_xkb_config(state, XkbConfig::default())
@@ -128,26 +160,26 @@ pub fn type_text(state: &mut Tvbox, text: &str) -> anyhow::Result<usize> {
     Ok(keys.len())
 }
 
-fn send(state: &mut Tvbox, keyboard: &KeyboardHandle<Tvbox>, keys: &[Keycode]) {
+fn send(state: &mut Tvbox, keyboard: &KeyboardHandle<Tvbox>, strokes: &[(Keycode, bool)]) {
     let time = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u32;
 
-    for key in keys {
-        for pressed in [
-            smithay::backend::input::KeyState::Pressed,
-            smithay::backend::input::KeyState::Released,
-        ] {
-            keyboard.input_forward(
-                state,
-                *key,
-                pressed,
-                SERIAL_COUNTER.next_serial(),
-                time,
-                false,
-            );
-        }
+    for (key, pressed) in strokes {
+        let key_state = if *pressed {
+            smithay::backend::input::KeyState::Pressed
+        } else {
+            smithay::backend::input::KeyState::Released
+        };
+        keyboard.input_forward(
+            state,
+            *key,
+            key_state,
+            SERIAL_COUNTER.next_serial(),
+            time,
+            false,
+        );
     }
 }
 
@@ -189,6 +221,41 @@ mod tests {
         assert!(keymap.contains("U00ED")); // í
         assert!(keymap.contains("U0021")); // !
         assert_eq!(keys.len(), "Árvíz!".chars().count());
+    }
+
+    #[test]
+    fn every_key_that_goes_down_comes_back_up() {
+        // A modifier left down would apply to everything typed after it, and a
+        // character key left down repeats.
+        let (_, keys) = keymap_for("hello").expect("fits");
+        let mut strokes = select_all_chord();
+        strokes.extend(strokes_for(&keys));
+
+        let mut held: Vec<Keycode> = Vec::new();
+        for (key, pressed) in strokes {
+            if pressed {
+                assert!(!held.contains(&key), "pressed twice without a release");
+                held.push(key);
+            } else {
+                let at = held
+                    .iter()
+                    .position(|k| *k == key)
+                    .expect("released unpressed key");
+                held.remove(at);
+            }
+        }
+        assert!(held.is_empty(), "keys left down: {held:?}");
+    }
+
+    #[test]
+    fn select_all_finishes_before_the_first_character() {
+        // Control must be up again by then: with it still held the string would go
+        // out as shortcuts rather than text.
+        let chord = select_all_chord();
+        assert_eq!(
+            chord.last().map(|(k, down)| (u32::from(*k), *down)),
+            Some((CTRL_KEYCODE, false))
+        );
     }
 
     #[test]
