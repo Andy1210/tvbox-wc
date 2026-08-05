@@ -108,6 +108,15 @@ pub struct Tvbox {
     pub cursor_status: CursorImageStatus,
     /// Where the pointer is, in output coordinates.
     pub pointer_location: Point<f64, Logical>,
+    /// Whether the pointer is currently drawn.
+    ///
+    /// A wireless TV remote often presents a mouse endpoint as well, so a box with
+    /// no mouse at all still gets a pointer parked on screen that never moves. It is
+    /// hidden after [`crate::cursor::IDLE`] without motion and comes back on the
+    /// first move.
+    pub pointer_visible: bool,
+    /// When the pointer last moved.
+    pub pointer_moved_at: std::time::Instant,
     /// What the shell says is on screen.
     pub focus: Focus,
 }
@@ -254,6 +263,7 @@ impl Tvbox {
             &output,
             &self.cursor_status,
             self.pointer_location,
+            self.pointer_visible,
         );
         crate::screenshot::capture(&mut device.renderer, &output, &elements, path)
     }

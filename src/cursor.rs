@@ -20,6 +20,34 @@ use smithay::utils::{Logical, Physical, Point, Scale};
 use smithay::wayland::compositor::with_states;
 
 use crate::render::Element;
+use crate::state::Tvbox;
+
+/// How long the pointer sits still before it is taken off the screen.
+pub const IDLE: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Take the pointer off the screen while it is not being used.
+///
+/// A wireless TV remote often presents a mouse endpoint too, so a box nobody has
+/// ever plugged a mouse into still shows a pointer that never moves. Checked on a
+/// timer rather than armed per motion event: a moving pointer fires hundreds of
+/// those a second, and rescheduling on each one costs more than one check a second.
+pub fn hide_when_idle(
+    loop_handle: &smithay::reexports::calloop::LoopHandle<'static, Tvbox>,
+) -> anyhow::Result<()> {
+    let timer = smithay::reexports::calloop::timer::Timer::from_duration(IDLE);
+    loop_handle
+        .insert_source(timer, |_, _, state| {
+            if state.pointer_visible && state.pointer_moved_at.elapsed() >= IDLE {
+                state.pointer_visible = false;
+                state.queue_redraw();
+            }
+            smithay::reexports::calloop::timer::TimeoutAction::ToDuration(
+                std::time::Duration::from_secs(1),
+            )
+        })
+        .map_err(|err| anyhow::anyhow!("failed to insert the pointer-idle timer: {err}"))?;
+    Ok(())
+}
 
 /// Render elements for the pointer, front-most in the scene.
 pub fn elements(

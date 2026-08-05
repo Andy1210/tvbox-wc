@@ -113,6 +113,8 @@ fn pointer_motion(state: &mut Tvbox, position: Point<f64, Logical>, time: u32) {
     )
         .into();
     state.pointer_location = position;
+    state.pointer_moved_at = std::time::Instant::now();
+    state.pointer_visible = true;
 
     let Some(pointer) = state.seat.get_pointer() else {
         return;

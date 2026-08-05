@@ -98,6 +98,8 @@ pub fn run(options: cli::Options) -> Result<()> {
         seat,
         cursor_status: CursorImageStatus::default_named(),
         pointer_location: (0.0, 0.0).into(),
+        pointer_visible: true,
+        pointer_moved_at: std::time::Instant::now(),
         focus: Default::default(),
     };
 
@@ -196,6 +198,8 @@ pub fn run(options: cli::Options) -> Result<()> {
             }
         })
         .map_err(|err| anyhow::anyhow!("failed to insert the udev source: {err}"))?;
+
+    cursor::hide_when_idle(&event_loop.handle())?;
 
     let libinput = input::init(&session, &seat_name)?;
     event_loop

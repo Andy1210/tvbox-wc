@@ -667,6 +667,7 @@ pub fn render(state: &mut crate::state::Tvbox) {
         &output,
         &state.cursor_status,
         state.pointer_location,
+        state.pointer_visible,
     );
 
     trace!(elements = elements.len(), "rendering");

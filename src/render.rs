@@ -36,11 +36,16 @@ pub fn elements(
     output: &Output,
     cursor: &CursorImageStatus,
     pointer: Point<f64, Logical>,
+    pointer_visible: bool,
 ) -> Vec<Element> {
     let scale = Scale::from(output.current_scale().fractional_scale());
     // The pointer is in front of everything, which is also the order the cursor
     // plane sits in.
-    let mut elements = crate::cursor::elements(renderer, cursor, pointer, scale);
+    let mut elements = if pointer_visible {
+        crate::cursor::elements(renderer, cursor, pointer, scale)
+    } else {
+        Vec::new()
+    };
     let layers = layer_map_for_output(output);
 
     let push_layer_group =
