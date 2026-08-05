@@ -10,6 +10,7 @@
 
 #![warn(missing_docs)]
 
+pub mod cli;
 pub mod kms;
 
 mod backend;
@@ -18,6 +19,7 @@ mod input;
 mod ipc;
 mod render;
 mod screenshot;
+mod session;
 mod stacking;
 mod state;
 mod typing;
@@ -56,7 +58,7 @@ use crate::backend::Tty;
 use crate::state::{ClientState, Tvbox};
 
 /// Run the compositor until it is asked to stop.
-pub fn run() -> Result<()> {
+pub fn run(options: cli::Options) -> Result<()> {
     let mut event_loop: EventLoop<Tvbox> = EventLoop::try_new().context("EventLoop::try_new")?;
     let display: Display<Tvbox> = Display::new().context("Display::new")?;
     let display_handle = display.handle();
@@ -242,10 +244,23 @@ pub fn run() -> Result<()> {
 
     backend::render(&mut state);
 
+    // The session starts only now: it opens the display connection in its first
+    // milliseconds, and a socket that is not listening yet is a client that exits.
+    let session = match options.session {
+        Some(command) => Some(session::spawn(
+            &event_loop.handle(),
+            command,
+            state.running.clone(),
+        )?),
+        None => None,
+    };
+
     let running = state.running.clone();
+    let signal = event_loop.get_signal();
     event_loop
         .run(Some(Duration::from_millis(16)), &mut state, |state| {
             if !running.load(Ordering::SeqCst) {
+                signal.stop();
                 state.loop_handle.insert_idle(|_| {});
             }
             ipc::register_pending(state);
@@ -255,6 +270,13 @@ pub fn run() -> Result<()> {
             let _ = state.display_handle.flush_clients();
         })
         .context("the event loop failed")?;
+
+    // greetd ends the session by killing the process group, but a compositor that
+    // stopped on its own (the quit combination) would otherwise leave the shell
+    // running against a display that is gone.
+    if let Some(session) = session {
+        session.stop();
+    }
 
     Ok(())
 }
