@@ -67,6 +67,22 @@ xdg-shell and layer-shell, the plane policy, the shell IPC, HDR arbitration.
 - **Do not copy code from niri.** It is GPL-3.0-or-later and was read here as a
   reference implementation. Anything learned from it is re-derived from measurements.
 
+## Installing
+
+The box takes a release binary: `tvbox-wc-aarch64` is attached to every `v*` tag,
+with its sha256 next to it, and tvbox's `deploy/install-compositor.sh` pins both.
+Nothing else is needed at runtime beyond the libraries it links against
+(`libgbm1 libseat1 libinput10 libxkbcommon0 libwayland-server0 libegl1 libgles2`).
+
+greetd starts it as the whole session:
+
+```
+command = "tvbox-wc -- /usr/local/bin/tvbox-session"
+```
+
+Everything after `--` is started once the Wayland socket is listening, and the
+compositor stops when it exits.
+
 ## Building
 
 Needs a recent stable Rust (1.85+) and the Smithay build dependencies:

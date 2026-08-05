@@ -1,0 +1,49 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    # An arm64 runner rather than a cross toolchain: this only ever runs on a
+    # Raspberry Pi 5, and a native build is also what the tests run on.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - name: build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc clang libclang-dev libudev-dev libgbm-dev \
+            libxkbcommon-dev libegl-dev libgles-dev libwayland-dev libinput-dev \
+            libseat-dev libdisplay-info-dev
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      - run: cargo build --release
+      - name: name the binary after the platform it runs on
+        run: cp target/release/tvbox-wc tvbox-wc-aarch64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tvbox-wc-aarch64
+          path: tvbox-wc-aarch64
+      # The box installs a release binary by sha256, so the sum is part of the
+      # release rather than something to work out afterwards.
+      - name: checksum
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: sha256sum tvbox-wc-aarch64 | tee tvbox-wc-aarch64.sha256
+      - uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/v')
+        with:
+          files: |
+            tvbox-wc-aarch64
+            tvbox-wc-aarch64.sha256
