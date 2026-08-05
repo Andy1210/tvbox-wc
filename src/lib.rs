@@ -14,6 +14,7 @@ pub mod kms;
 
 mod backend;
 mod input;
+mod ipc;
 mod render;
 mod state;
 
@@ -201,8 +202,16 @@ pub fn run() -> Result<()> {
         )
         .map_err(|err| anyhow::anyhow!("failed to insert the wayland source: {err}"))?;
 
+    let runtime_dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_owned());
+    let control_socket = ipc::listen(
+        &event_loop.handle(),
+        std::path::PathBuf::from(runtime_dir).join("tvbox-wc.sock"),
+    )?;
+
     unsafe { std::env::set_var("WAYLAND_DISPLAY", &socket_name) };
-    info!(socket = ?socket_name, "tvbox-wc is up");
+    // The shell finds the control socket the same way it finds the display.
+    unsafe { std::env::set_var("TVBOX_WC_SOCKET", &control_socket) };
+    info!(socket = ?socket_name, control = ?control_socket, "tvbox-wc is up");
 
     backend::render(&mut state);
 
@@ -212,6 +221,7 @@ pub fn run() -> Result<()> {
             if !running.load(Ordering::SeqCst) {
                 state.loop_handle.insert_idle(|_| {});
             }
+            ipc::register_pending(state);
             state.space.refresh();
             state.popups.cleanup();
             state::refresh_primary_scanout_output(state);

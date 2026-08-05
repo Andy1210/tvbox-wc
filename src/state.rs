@@ -151,6 +151,37 @@ impl Tvbox {
             .cloned()
     }
 
+    /// Drive the output at a different mode, and put everything back on it.
+    ///
+    /// The compositor's own surfaces have to follow: a layer surface is laid out
+    /// against the output size, and a fullscreen window is sized to it, so both need
+    /// a fresh configure or the screen keeps the old geometry with a new mode under
+    /// it.
+    pub fn set_mode(
+        &mut self,
+        name: &str,
+        w: i32,
+        h: i32,
+        refresh: Option<i32>,
+    ) -> anyhow::Result<()> {
+        let mode = self.tty.set_mode(name, w, h, refresh)?;
+
+        if let Some(output) = self.output.clone() {
+            output.change_current_state(Some(mode), None, None, None);
+            output.set_preferred(mode);
+            self.space.map_output(&output, (0, 0));
+            layer_map_for_output(&output).arrange();
+
+            let windows: Vec<Window> = self.space.elements().cloned().collect();
+            for window in windows {
+                self.fullscreen(&window);
+            }
+        }
+
+        self.queue_redraw();
+        Ok(())
+    }
+
     /// Ask for a frame. Nothing else schedules one: without damage the compositor
     /// sits still, which is the point, but it also means every change has to say so.
     ///

@@ -1,0 +1,279 @@
+//! The shell's control channel.
+//!
+//! A unix socket in `$XDG_RUNTIME_DIR`, one JSON object per line, request and
+//! response matched by `id`. That shape is not chosen for elegance: the shell
+//! already speaks exactly this to mpv, so it needs no new client code and a person
+//! can drive it from a terminal.
+//!
+//! ```text
+//! -> {"id":1,"request":"get_outputs"}
+//! <- {"id":1,"ok":{"outputs":[{"name":"HDMIA-1","current":{"w":1360,"h":768,"refresh":60000},...}]}}
+//! -> {"id":2,"request":"set_mode","output":"HDMIA-1","w":1920,"h":1080}
+//! <- {"id":2,"ok":null}
+//! -> {"id":3,"request":"nonsense"}
+//! <- {"id":3,"error":"unknown request"}
+//! ```
+//!
+//! The socket is owned by the session user and lives in a directory only that user
+//! can reach, which is the same protection mpv's control socket has. Anything that
+//! could reach this socket can already reach the compositor's Wayland socket.
+
+use std::io::{ErrorKind, Read, Write};
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::PathBuf;
+
+use anyhow::{Context as _, Result};
+use serde::{Deserialize, Serialize};
+use smithay::reexports::calloop::generic::Generic;
+use smithay::reexports::calloop::{Interest, LoopHandle, Mode, PostAction};
+use tracing::{debug, warn};
+
+use crate::state::Tvbox;
+
+/// A request from the shell.
+#[derive(Debug, Deserialize)]
+#[serde(tag = "request", rename_all = "snake_case")]
+pub enum Request {
+    /// Everything the shell needs to decide what to ask for.
+    GetOutputs,
+    /// Drive the output at a different mode.
+    ///
+    /// The refresh rate is optional: a TV usually offers one rate per size, and the
+    /// shell should not have to know which of 59.94 and 60 the kernel reports.
+    SetMode {
+        /// Connector name, as reported by `get_outputs`.
+        output: String,
+        /// Width in pixels.
+        w: i32,
+        /// Height in pixels.
+        h: i32,
+        /// Refresh rate in mHz, if it matters.
+        #[serde(default)]
+        refresh: Option<i32>,
+    },
+}
+
+/// A mode, in the units the Wayland output protocol uses.
+#[derive(Debug, Serialize)]
+pub struct ModeInfo {
+    /// Width in pixels.
+    pub w: i32,
+    /// Height in pixels.
+    pub h: i32,
+    /// Refresh rate in mHz.
+    pub refresh: i32,
+    /// Whether the display asked for this one.
+    pub preferred: bool,
+}
+
+/// What an output can do and what it is doing.
+#[derive(Debug, Serialize)]
+pub struct OutputInfo {
+    /// Connector name.
+    pub name: String,
+    /// The mode in use.
+    pub current: Option<ModeInfo>,
+    /// Every mode the connector advertises.
+    pub modes: Vec<ModeInfo>,
+}
+
+#[derive(Debug, Serialize)]
+struct Response<'a> {
+    id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ok: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<&'a str>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Envelope {
+    #[serde(default)]
+    id: Option<u64>,
+    #[serde(flatten)]
+    request: Request,
+}
+
+/// Start listening, and return the path so it can be handed to children.
+pub fn listen(loop_handle: &LoopHandle<'static, Tvbox>, path: PathBuf) -> Result<PathBuf> {
+    // A socket left behind by a compositor that did not shut down cleanly would
+    // otherwise make every start after a crash fail.
+    let _ = std::fs::remove_file(&path);
+    let listener = UnixListener::bind(&path)
+        .with_context(|| format!("failed to bind the control socket at {}", path.display()))?;
+    listener
+        .set_nonblocking(true)
+        .context("failed to make the control socket non-blocking")?;
+
+    loop_handle
+        .insert_source(
+            Generic::new(listener, Interest::READ, Mode::Level),
+            |_, listener, _state| {
+                loop {
+                    match listener.accept() {
+                        Ok((stream, _)) => accept(stream),
+                        Err(err) if err.kind() == ErrorKind::WouldBlock => break,
+                        Err(err) => {
+                            warn!(?err, "failed to accept a control connection");
+                            break;
+                        }
+                    }
+                }
+                Ok(PostAction::Continue)
+            },
+        )
+        .map_err(|err| anyhow::anyhow!("failed to insert the control socket source: {err}"))?;
+
+    Ok(path)
+}
+
+fn accept(stream: UnixStream) {
+    if let Err(err) = stream.set_nonblocking(true) {
+        warn!(?err, "failed to configure a control connection");
+        return;
+    }
+    debug!("control connection accepted");
+
+    // Registering from inside the accept callback needs the loop handle, which the
+    // state carries; do it from an idle callback so the borrow is clean.
+    CONNECTIONS.with(|pending| pending.borrow_mut().push(stream));
+}
+
+thread_local! {
+    static CONNECTIONS: std::cell::RefCell<Vec<UnixStream>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Register any connection accepted since the last call.
+///
+/// Called from the event loop's per-iteration callback: accepting and registering
+/// in one step would need the loop handle inside a source's own callback.
+pub fn register_pending(state: &mut Tvbox) {
+    let pending: Vec<UnixStream> =
+        CONNECTIONS.with(|pending| pending.borrow_mut().drain(..).collect());
+    for stream in pending {
+        let mut buffer = Vec::new();
+        let inserted = state.loop_handle.insert_source(
+            Generic::new(stream, Interest::READ, Mode::Level),
+            move |_, stream, state: &mut Tvbox| {
+                let mut chunk = [0u8; 4096];
+                loop {
+                    match (&**stream).read(&mut chunk) {
+                        Ok(0) => return Ok(PostAction::Remove),
+                        Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+                        Err(err) if err.kind() == ErrorKind::WouldBlock => break,
+                        Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+                        Err(err) => {
+                            warn!(?err, "control connection failed");
+                            return Ok(PostAction::Remove);
+                        }
+                    }
+                }
+
+                while let Some(end) = buffer.iter().position(|byte| *byte == b'\n') {
+                    let line: Vec<u8> = buffer.drain(..=end).collect();
+                    let reply = handle_line(state, &line[..line.len() - 1]);
+                    if let Err(err) = send(stream, &reply) {
+                        warn!(?err, "failed to answer a control request");
+                        return Ok(PostAction::Remove);
+                    }
+                }
+
+                Ok(PostAction::Continue)
+            },
+        );
+        if let Err(err) = inserted {
+            warn!(?err, "failed to register a control connection");
+        }
+    }
+}
+
+fn handle_line(state: &mut Tvbox, line: &[u8]) -> String {
+    if line.iter().all(u8::is_ascii_whitespace) {
+        return String::new();
+    }
+
+    let envelope: Envelope = match serde_json::from_slice(line) {
+        Ok(envelope) => envelope,
+        Err(err) => {
+            return encode(&Response {
+                id: None,
+                ok: None,
+                error: Some(&err.to_string()),
+            });
+        }
+    };
+
+    let id = envelope.id;
+    match dispatch(state, envelope.request) {
+        Ok(value) => encode(&Response {
+            id,
+            ok: Some(value),
+            error: None,
+        }),
+        Err(err) => encode(&Response {
+            id,
+            ok: None,
+            error: Some(&err.to_string()),
+        }),
+    }
+}
+
+fn dispatch(state: &mut Tvbox, request: Request) -> Result<serde_json::Value> {
+    match request {
+        Request::GetOutputs => {
+            let outputs = state.tty.outputs();
+            Ok(serde_json::json!({ "outputs": outputs }))
+        }
+        Request::SetMode {
+            output,
+            w,
+            h,
+            refresh,
+        } => {
+            state.set_mode(&output, w, h, refresh)?;
+            Ok(serde_json::Value::Null)
+        }
+    }
+}
+
+fn encode(response: &Response<'_>) -> String {
+    serde_json::to_string(response).unwrap_or_else(|err| {
+        format!("{{\"id\":null,\"error\":\"failed to encode a response: {err}\"}}")
+    })
+}
+
+fn send(mut stream: &UnixStream, reply: &str) -> std::io::Result<()> {
+    if reply.is_empty() {
+        return Ok(());
+    }
+    let mut payload = reply.as_bytes();
+    let mut line = Vec::with_capacity(payload.len() + 1);
+    line.extend_from_slice(payload);
+    line.push(b'\n');
+    payload = &line;
+
+    // Replies are a few hundred bytes and the socket buffer is orders of magnitude
+    // larger, so a partial write means the peer has stopped reading. Retrying a
+    // bounded number of times keeps a stuck client from blocking the compositor.
+    let mut written = 0;
+    for _ in 0..16 {
+        match stream.write(&payload[written..]) {
+            Ok(0) => break,
+            Ok(n) => {
+                written += n;
+                if written == payload.len() {
+                    return Ok(());
+                }
+            }
+            Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                std::thread::yield_now();
+            }
+            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Err(std::io::Error::new(
+        ErrorKind::WouldBlock,
+        "the client stopped reading",
+    ))
+}

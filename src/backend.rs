@@ -22,6 +22,7 @@ use smithay::backend::renderer::{ImportDma, ImportEgl};
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::Session;
 use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Subpixel};
+use smithay::reexports::drm;
 use smithay::reexports::drm::control::{connector, crtc, Device as _, ModeTypeFlags};
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::utils::DeviceFd;
@@ -37,6 +38,8 @@ pub type Compositor =
 pub struct Surface {
     /// The CRTC this output is driven by.
     pub crtc: crtc::Handle,
+    /// The connector, kept so modes can be looked up again later.
+    pub connector: connector::Handle,
     /// Plane assignment, swapchain and page flips.
     pub compositor: Compositor,
     /// A page flip is in flight; the next render waits for its vblank.
@@ -202,6 +205,7 @@ impl Tty {
 
         device.surface = Some(Surface {
             crtc,
+            connector: connector.handle(),
             compositor,
             frame_pending: false,
             redraw_needed: true,
@@ -209,6 +213,92 @@ impl Tty {
         });
 
         Ok(output)
+    }
+
+    /// What the output is doing and what it could do, for the shell.
+    pub fn outputs(&self) -> Vec<crate::ipc::OutputInfo> {
+        let Some(device) = self.device.as_ref() else {
+            return Vec::new();
+        };
+        let Some(surface) = device.surface.as_ref() else {
+            return Vec::new();
+        };
+        let Ok(connector) = device.drm.get_connector(surface.connector, false) else {
+            return Vec::new();
+        };
+
+        let current = surface.compositor.surface().pending_mode();
+        let describe = |mode: &drm::control::Mode| crate::ipc::ModeInfo {
+            w: mode.size().0 as i32,
+            h: mode.size().1 as i32,
+            refresh: (mode.vrefresh() * 1000) as i32,
+            preferred: mode.mode_type().contains(ModeTypeFlags::PREFERRED),
+        };
+
+        vec![crate::ipc::OutputInfo {
+            name: format!("{:?}-{}", connector.interface(), connector.interface_id()),
+            current: Some(describe(&current)),
+            modes: connector.modes().iter().map(describe).collect(),
+        }]
+    }
+
+    /// Drive the output at a different mode.
+    ///
+    /// A refresh rate is optional because a TV usually offers one rate per size,
+    /// and the shell should not have to know whether the kernel calls it 59.94 or
+    /// 60.
+    pub fn set_mode(
+        &mut self,
+        name: &str,
+        w: i32,
+        h: i32,
+        refresh: Option<i32>,
+    ) -> Result<OutputMode> {
+        let device = self
+            .device
+            .as_mut()
+            .ok_or_else(|| anyhow!("no device opened"))?;
+        let surface = device
+            .surface
+            .as_mut()
+            .ok_or_else(|| anyhow!("no output"))?;
+        let connector = device
+            .drm
+            .get_connector(surface.connector, false)
+            .context("failed to read the connector")?;
+
+        let output_name = format!("{:?}-{}", connector.interface(), connector.interface_id());
+        if output_name != name {
+            return Err(anyhow!("no output named {name}"));
+        }
+
+        let mode = connector
+            .modes()
+            .iter()
+            .filter(|mode| mode.size() == (w as u16, h as u16))
+            .find(|mode| match refresh {
+                Some(wanted) => (mode.vrefresh() * 1000) as i32 == wanted,
+                None => true,
+            })
+            .copied()
+            .ok_or_else(|| anyhow!("no mode {w}x{h} on {name}"))?;
+
+        surface
+            .compositor
+            .use_mode(mode)
+            .map_err(|err| anyhow!("failed to set the mode: {err}"))?;
+        surface.frame_pending = false;
+        surface.redraw_needed = true;
+
+        info!(
+            output = name,
+            mode = format!("{w}x{h}@{}", mode.vrefresh()),
+            "mode set"
+        );
+        Ok(OutputMode {
+            size: (w, h).into(),
+            refresh: (mode.vrefresh() * 1000) as i32,
+        })
     }
 
     /// The formats the display engine can scan out, from the planes this output
