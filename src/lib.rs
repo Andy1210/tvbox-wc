@@ -16,6 +16,7 @@ mod backend;
 mod input;
 mod ipc;
 mod render;
+mod screenshot;
 mod state;
 
 use std::sync::atomic::{AtomicBool, Ordering};

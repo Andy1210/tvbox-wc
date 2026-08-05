@@ -53,6 +53,11 @@ pub enum Request {
     },
     /// What the compositor is currently told and doing.
     GetState,
+    /// Render the scene to a PNG, for looking at the screen from a terminal.
+    Screenshot {
+        /// Where to write it.
+        path: String,
+    },
     /// Tell the compositor who owns the screen.
     ///
     /// It cannot work this out for itself: the launcher and an app can be windows
@@ -285,6 +290,10 @@ fn dispatch(state: &mut Tvbox, request: Request) -> Result<serde_json::Value> {
             Ok(serde_json::Value::Null)
         }
         Request::GetState => Ok(serde_json::json!({ "focus": state.focus })),
+        Request::Screenshot { path } => {
+            let (w, h) = state.screenshot(std::path::Path::new(&path))?;
+            Ok(serde_json::json!({ "path": path, "w": w, "h": h }))
+        }
         Request::SetFocus { owner, app } => {
             state.focus = match owner {
                 FocusOwner::Launcher => Focus::Launcher,

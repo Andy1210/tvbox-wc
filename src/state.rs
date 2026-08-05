@@ -199,6 +199,21 @@ impl Tvbox {
         Ok(())
     }
 
+    /// Render the scene to a PNG.
+    pub fn screenshot(&mut self, path: &std::path::Path) -> anyhow::Result<(i32, i32)> {
+        let output = self
+            .output
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("no output"))?;
+        let device = self
+            .tty
+            .device
+            .as_mut()
+            .ok_or_else(|| anyhow::anyhow!("no device opened"))?;
+        let elements = crate::render::elements(&mut device.renderer, &self.space, &output);
+        crate::screenshot::capture(&mut device.renderer, &output, &elements, path)
+    }
+
     /// Ask for a frame. Nothing else schedules one: without damage the compositor
     /// sits still, which is the point, but it also means every change has to say so.
     ///

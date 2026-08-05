@@ -80,6 +80,22 @@ because the launcher handles it itself. The shell does this today with
 `sendInputEvent` in three separate places; here it happens once, for every client,
 including the ones that are not Electron.
 
+### `screenshot`
+
+```json
+{"id": 6, "request": "screenshot", "path": "/tmp/screen.png"}
+{"id": 6, "ok": {"path": "/tmp/screen.png", "w": 1360, "h": 768}}
+```
+
+Renders the scene off-screen and writes a PNG. It exists for measurement: with the
+video on a plane and the compositor doing no GPU work, "everything is fine" reads
+the same as a frozen screen in every counter, twice measured. Two shots a few
+seconds apart, compared, is the cheapest honest check that a client is drawing.
+
+What it captures is the scene, not the planes as the display engine composes them.
+That is also what a capture protocol would hand a client. Whether the right thing
+is on the right plane is a question for the plane state, not for this.
+
 ### Errors
 
 ```json

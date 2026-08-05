@@ -38,6 +38,8 @@ def main():
 
     command = sys.argv[1]
     payload = {"id": 1, "request": command}
+    if command == "screenshot":
+        payload["path"] = sys.argv[2] if len(sys.argv) > 2 else "/tmp/tvbox-wc.png"
     if command == "set_focus":
         if len(sys.argv) < 3:
             print("usage: wcctl.py set_focus <launcher|app> [app-id]")
