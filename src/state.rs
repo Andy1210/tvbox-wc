@@ -217,8 +217,16 @@ impl CompositorHandler for Tvbox {
         }
         if let Some(window) = self.window_for_surface(&root) {
             window.on_commit();
-            // A TV box has one screen and one thing on it.
-            self.fullscreen(&window);
+            // A TV box has one screen and one thing on it - but only once the client
+            // has mapped. Forcing a size and the fullscreen state in the FIRST
+            // configure makes a client resize before it has configured its video,
+            // and mpv dereferences a null `target_params` when that happens
+            // (vo_dmabuf_wayland.c:541). The protocol says the same thing: let the
+            // client pick its first size.
+            let mapped = window.geometry().size.w > 0 && window.geometry().size.h > 0;
+            if mapped {
+                self.fullscreen(&window);
+            }
         }
 
         self.popups.commit(surface);
@@ -348,9 +356,10 @@ impl XdgShellHandler for Tvbox {
     }
 
     fn new_toplevel(&mut self, surface: ToplevelSurface) {
+        // No state forced here: the first configure goes out empty, and the window
+        // is fullscreened once it has mapped. See the comment in commit().
         let window = Window::new_wayland_window(surface);
         self.space.map_element(window.clone(), (0, 0), true);
-        self.fullscreen(&window);
         self.refresh_keyboard_focus();
         self.queue_redraw();
     }

@@ -208,6 +208,38 @@ impl Tty {
         Ok(output)
     }
 
+    /// The formats the display engine can scan out, from the planes this output
+    /// actually uses.
+    ///
+    /// Advertised to clients as a scan-out tranche: without it a client allocates
+    /// whatever its renderer likes (BROADCOM_UIF here), no plane can take that
+    /// buffer, and the compositor is back to compositing everything - including the
+    /// film that was happily on the primary plane a moment earlier.
+    pub fn scanout_formats(&self) -> Vec<smithay::backend::allocator::Format> {
+        let Some(device) = self.device.as_ref() else {
+            return Vec::new();
+        };
+        let Some(surface) = device.surface.as_ref() else {
+            return Vec::new();
+        };
+        let drm_surface = surface.compositor.surface();
+        let renderer_formats: std::collections::HashSet<_> =
+            device.renderer.dmabuf_formats().into_iter().collect();
+
+        let planes = drm_surface.planes();
+        let mut formats: Vec<smithay::backend::allocator::Format> =
+            std::iter::once(drm_surface.plane_info())
+                .chain(planes.overlay.iter())
+                .flat_map(|plane| plane.formats.iter().copied())
+                // Keep only what we could also composite: a buffer we can neither scan
+                // out nor import is a black screen with no way back.
+                .filter(|format| renderer_formats.contains(format))
+                .collect();
+        formats.sort_by_key(|format| (format.code as u32, u64::from(format.modifier)));
+        formats.dedup();
+        formats
+    }
+
     /// The formats clients may hand us.
     pub fn renderer_formats(&self) -> Vec<smithay::backend::allocator::Format> {
         self.device
@@ -231,6 +263,12 @@ impl Tty {
             return Some(node);
         }
         render_node_on_the_system().or(card)
+    }
+
+    /// The card node the output lives on, which is where a buffer must be able to
+    /// be scanned out.
+    pub fn device_node(&self) -> Option<DrmNode> {
+        DrmNode::from_file(self.device.as_ref()?.gbm.as_fd()).ok()
     }
 
     /// Check that a client's dmabuf is at least renderable.
@@ -348,11 +386,16 @@ pub fn render(state: &mut crate::state::Tvbox) {
 
     trace!(elements = elements.len(), "rendering");
 
+    // ALLOW_PRIMARY_PLANE_SCANOUT_ANY is the load-bearing flag, and it is not in
+    // DEFAULT: without it an element may only take the primary plane when its format
+    // matches the composition swapchain's. The swapchain is XRGB and a decoded frame
+    // is NV12 or P030, so every film would be composited instead of scanned out -
+    // which is the entire cost this compositor exists to avoid.
     match surface.compositor.render_frame(
         &mut device.renderer,
         &elements,
         [0.0, 0.0, 0.0, 1.0],
-        FrameFlags::DEFAULT,
+        FrameFlags::DEFAULT | FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY,
     ) {
         Ok(result) => {
             if result.is_empty {

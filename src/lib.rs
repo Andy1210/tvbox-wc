@@ -31,6 +31,7 @@ use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::{EventLoop, Interest, Mode, PostAction};
 use smithay::reexports::wayland_server::{Display, DisplayHandle};
 use smithay::wayland::compositor::CompositorState;
+use smithay::reexports::wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_feedback_v1::TrancheFlags;
 use smithay::wayland::dmabuf::{DmabufFeedbackBuilder, DmabufState};
 use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::presentation::PresentationState;
@@ -115,7 +116,24 @@ pub fn run() -> Result<()> {
                 .count(),
             "advertising dmabuf formats"
         );
-        match DmabufFeedbackBuilder::new(node.dev_id(), formats).build() {
+        let scanout = state.tty.scanout_formats();
+        let scanout_node = state.tty.device_node();
+        info!(
+            scanout_formats = scanout.len(),
+            "advertising a scan-out tranche"
+        );
+
+        let mut builder = DmabufFeedbackBuilder::new(node.dev_id(), formats);
+        if let Some(scanout_node) = scanout_node {
+            if !scanout.is_empty() {
+                builder = builder.add_preference_tranche(
+                    scanout_node.dev_id(),
+                    Some(TrancheFlags::Scanout),
+                    scanout,
+                );
+            }
+        }
+        match builder.build() {
             Ok(feedback) => {
                 let global = state
                     .dmabuf_state
