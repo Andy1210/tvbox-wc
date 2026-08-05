@@ -137,11 +137,20 @@ impl Tvbox {
         }
         drop(layers);
 
-        if let Some((window, location)) = self.space.element_under(position) {
+        // Front to back by the box's own stacking rule, not map order: the pointer
+        // must land on the shell's UI even when a film mapped after it.
+        for window in crate::stacking::stacked(&self.space).into_iter().rev() {
+            let Some(geometry) = self.space.element_geometry(&window) else {
+                continue;
+            };
+            if !geometry.to_f64().contains(position) {
+                continue;
+            }
+            let location = geometry.loc.to_f64();
             if let Some((surface, offset)) =
-                window.surface_under(position - location.to_f64(), WindowSurfaceType::ALL)
+                window.surface_under(position - location, WindowSurfaceType::ALL)
             {
-                return Some((surface, location.to_f64() + offset.to_f64()));
+                return Some((surface, location + offset.to_f64()));
             }
         }
 
@@ -309,7 +318,7 @@ impl Tvbox {
     }
 
     /// Give the keyboard to whatever should have it now: the topmost layer surface
-    /// that asked for it, otherwise the newest window.
+    /// that asked for it, otherwise the frontmost window.
     pub fn refresh_keyboard_focus(&mut self) {
         let Some(keyboard) = self.seat.get_keyboard() else {
             return;
@@ -325,9 +334,7 @@ impl Tvbox {
             }
         }
         let target = target.or_else(|| {
-            self.space
-                .elements()
-                .next_back()
+            crate::stacking::topmost(&self.space)
                 .and_then(|window| window.wl_surface().map(|s| s.into_owned()))
         });
 

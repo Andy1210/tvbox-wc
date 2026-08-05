@@ -18,6 +18,7 @@ mod input;
 mod ipc;
 mod render;
 mod screenshot;
+mod stacking;
 mod state;
 mod typing;
 

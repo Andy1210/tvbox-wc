@@ -2,9 +2,9 @@
 //!
 //! The list is front to back, which is also the order the DRM compositor walks when
 //! it hands elements to hardware planes. That ordering is the whole policy: the
-//! shell's UI is a layer surface, so it comes first and takes an overlay plane, and
-//! the fullscreen window below it - a film, usually - is left to take the primary
-//! plane untouched.
+//! shell's translucent UI comes first and takes an overlay plane, and the fullscreen
+//! window below it - a film, usually - is left to take the primary plane untouched.
+//! Which window is in front is [`crate::stacking`]'s decision, not map order.
 //!
 //! Every element is built as a [`Kind::ScanoutCandidate`], and that is not
 //! decoration. `try_assign_overlay_plane` refuses any element whose kind is not
@@ -67,11 +67,11 @@ pub fn elements(
     push_layer_group(&mut elements, renderer, Layer::Overlay);
     push_layer_group(&mut elements, renderer, Layer::Top);
 
-    for window in space.elements().rev() {
+    for window in crate::stacking::stacked(space).into_iter().rev() {
         let Some(surface) = window.wl_surface() else {
             continue;
         };
-        let Some(geometry) = space.element_geometry(window) else {
+        let Some(geometry) = space.element_geometry(&window) else {
             continue;
         };
         let location: Point<i32, Physical> = geometry.loc.to_physical_precise_round(scale);
