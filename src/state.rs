@@ -9,6 +9,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
 use smithay::backend::renderer::element::default_primary_scanout_output_compare;
+use smithay::backend::renderer::utils::on_commit_buffer_handler;
 use smithay::desktop::{
     layer_map_for_output, LayerSurface, PopupManager, Space, Window, WindowSurfaceType,
 };
@@ -199,6 +200,12 @@ impl CompositorHandler for Tvbox {
     }
 
     fn commit(&mut self, surface: &WlSurface) {
+        // Import the newly attached buffer into smithay's per-surface renderer
+        // state. Without this the surface has no buffer as far as rendering is
+        // concerned: clients commit, the scene stays empty, and nothing is ever
+        // released back to them.
+        on_commit_buffer_handler::<Self>(surface);
+
         // A subsurface commit is applied with its parent, so wait for that.
         if is_sync_subsurface(surface) {
             return;
@@ -476,6 +483,8 @@ impl DmabufHandler for Tvbox {
 delegate_compositor!(Tvbox);
 delegate_shm!(Tvbox);
 smithay::delegate_viewporter!(Tvbox);
+smithay::delegate_presentation!(Tvbox);
+smithay::delegate_single_pixel_buffer!(Tvbox);
 delegate_seat!(Tvbox);
 delegate_data_device!(Tvbox);
 delegate_output!(Tvbox);

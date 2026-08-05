@@ -33,10 +33,12 @@ use smithay::reexports::wayland_server::{Display, DisplayHandle};
 use smithay::wayland::compositor::CompositorState;
 use smithay::wayland::dmabuf::{DmabufFeedbackBuilder, DmabufState};
 use smithay::wayland::output::OutputManagerState;
+use smithay::wayland::presentation::PresentationState;
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::shell::wlr_layer::WlrLayerShellState;
 use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shm::ShmState;
+use smithay::wayland::single_pixel_buffer::SinglePixelBufferState;
 use smithay::wayland::socket::ListeningSocketSource;
 use smithay::wayland::viewporter::ViewporterState;
 use tracing::{info, warn};
@@ -95,10 +97,24 @@ pub fn run() -> Result<()> {
     let _output_manager = OutputManagerState::new_with_xdg_output::<Tvbox>(&display_handle);
     // mpv's dmabuf output refuses to start without it.
     let _viewporter = ViewporterState::new::<Tvbox>(&display_handle);
+    // A video player wants to know when its frame was actually shown, and builds
+    // its background out of a single-pixel buffer rather than an shm surface.
+    let _presentation =
+        PresentationState::new::<Tvbox>(&display_handle, libc::CLOCK_MONOTONIC as u32);
+    let _single_pixel = SinglePixelBufferState::new::<Tvbox>(&display_handle);
 
     state.tty.bind_wl_display(&display_handle);
     if let Some(node) = state.tty.render_node() {
         let formats = state.tty.renderer_formats();
+        info!(
+            node = ?node,
+            formats = formats.len(),
+            nv12 = formats
+                .iter()
+                .filter(|f| f.code == smithay::backend::allocator::Fourcc::Nv12)
+                .count(),
+            "advertising dmabuf formats"
+        );
         match DmabufFeedbackBuilder::new(node.dev_id(), formats).build() {
             Ok(feedback) => {
                 let global = state

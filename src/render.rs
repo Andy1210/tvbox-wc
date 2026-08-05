@@ -27,6 +27,20 @@ pub fn elements(
     let mut elements = Vec::new();
 
     let layers = layer_map_for_output(output);
+    tracing::trace!(
+        mode = ?output.current_mode(),
+        scale = output.current_scale().fractional_scale(),
+        layers = layers.layers().count(),
+        wanted = ?layers
+            .layers()
+            .map(|l| {
+                let state = l.cached_state();
+                (l.layer(), state.size, state.anchor, layers.layer_geometry(l))
+            })
+            .collect::<Vec<_>>(),
+        windows = space.elements().count(),
+        "scene"
+    );
     for wanted in [Layer::Overlay, Layer::Top] {
         for layer in layers.layers().rev() {
             if layer.layer() != wanted {

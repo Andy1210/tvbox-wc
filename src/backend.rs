@@ -15,7 +15,7 @@ use anyhow::{anyhow, Context as _, Result};
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
 use smithay::backend::drm::compositor::{DrmCompositor, FrameFlags};
-use smithay::backend::drm::{DrmDevice, DrmDeviceFd, DrmEvent, DrmNode};
+use smithay::backend::drm::{DrmDevice, DrmDeviceFd, DrmEvent, DrmNode, NodeType};
 use smithay::backend::egl::{EGLContext, EGLDisplay};
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::backend::renderer::{ImportDma, ImportEgl};
@@ -25,7 +25,7 @@ use smithay::output::{Mode as OutputMode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::drm::control::{connector, crtc, Device as _, ModeTypeFlags};
 use smithay::reexports::rustix::fs::OFlags;
 use smithay::utils::DeviceFd;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 
 use crate::kms::framebuffer::DirectFramebufferExporter;
 
@@ -216,11 +216,21 @@ impl Tty {
             .unwrap_or_default()
     }
 
-    /// The DRM node the renderer lives on, for dmabuf feedback.
+    /// The DRM node clients should allocate on.
+    ///
+    /// It has to be a RENDER node. On this hardware it is not derived from the card
+    /// we opened: the display device (vc4) has no render node of its own, and
+    /// rendering happens on a separate device (v3d) that has no connectors. Handing
+    /// out the card node instead sends every client to a device it cannot render on.
     pub fn render_node(&self) -> Option<DrmNode> {
-        self.device
-            .as_ref()
-            .and_then(|device| DrmNode::from_file(device.gbm.as_fd()).ok())
+        let card = DrmNode::from_file(self.device.as_ref()?.gbm.as_fd()).ok();
+        if let Some(node) = card
+            .and_then(|node| node.node_with_type(NodeType::Render))
+            .and_then(|node| node.ok())
+        {
+            return Some(node);
+        }
+        render_node_on_the_system().or(card)
     }
 
     /// Check that a client's dmabuf is at least renderable.
@@ -249,6 +259,25 @@ impl Tty {
     pub fn is_active(&self) -> bool {
         self.session.is_active()
     }
+}
+
+/// Any render node on the system, for hardware whose display device has none.
+fn render_node_on_the_system() -> Option<DrmNode> {
+    let mut candidates: Vec<PathBuf> = std::fs::read_dir("/dev/dri")
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.starts_with("renderD"))
+                .unwrap_or(false)
+        })
+        .collect();
+    candidates.sort();
+    candidates
+        .into_iter()
+        .find_map(|path| DrmNode::from_path(&path).ok())
 }
 
 /// The DRM device that has connectors.
@@ -307,10 +336,17 @@ pub fn render(state: &mut crate::state::Tvbox) {
         return;
     };
     if surface.frame_pending || !surface.redraw_needed {
+        trace!(
+            frame_pending = surface.frame_pending,
+            redraw_needed = surface.redraw_needed,
+            "skipping a render"
+        );
         return;
     }
 
     let elements = crate::render::elements(&mut device.renderer, &state.space, &output);
+
+    trace!(elements = elements.len(), "rendering");
 
     match surface.compositor.render_frame(
         &mut device.renderer,
@@ -342,6 +378,7 @@ pub fn render(state: &mut crate::state::Tvbox) {
 pub fn on_drm_event(state: &mut crate::state::Tvbox, event: DrmEvent) {
     match event {
         DrmEvent::VBlank(crtc) => {
+            trace!(?crtc, "vblank");
             if let Some(device) = state.tty.device.as_mut() {
                 if let Some(surface) = device.surface.as_mut() {
                     if surface.crtc == crtc {
