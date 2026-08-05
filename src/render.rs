@@ -38,7 +38,7 @@ pub fn elements(
     let mut elements = Vec::new();
     let layers = layer_map_for_output(output);
 
-    let mut push_layer_group =
+    let push_layer_group =
         |elements: &mut Vec<Element>, renderer: &mut GlesRenderer, wanted: Layer| {
             for layer in layers.layers().rev() {
                 if layer.layer() != wanted {
