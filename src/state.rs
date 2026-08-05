@@ -153,13 +153,38 @@ impl Tvbox {
 
     /// Ask for a frame. Nothing else schedules one: without damage the compositor
     /// sits still, which is the point, but it also means every change has to say so.
+    ///
+    /// The frame itself is rendered from an idle callback rather than here. Several
+    /// clients commit within one turn of the event loop, and rendering from each
+    /// commit means building the scene once per commit instead of once per frame -
+    /// wasted even when the result is thrown away as unchanged. Page flips are
+    /// already paced by the vblank; this paces the work in between.
     pub fn queue_redraw(&mut self) {
-        if let Some(device) = self.tty.device.as_mut() {
-            if let Some(surface) = device.surface.as_mut() {
-                surface.redraw_needed = true;
-            }
+        let Some(surface) = self
+            .tty
+            .device
+            .as_mut()
+            .and_then(|device| device.surface.as_mut())
+        else {
+            return;
+        };
+        surface.redraw_needed = true;
+        if surface.redraw_queued {
+            return;
         }
-        crate::backend::render(self);
+        surface.redraw_queued = true;
+
+        self.loop_handle.insert_idle(|state| {
+            if let Some(surface) = state
+                .tty
+                .device
+                .as_mut()
+                .and_then(|device| device.surface.as_mut())
+            {
+                surface.redraw_queued = false;
+            }
+            crate::backend::render(state);
+        });
     }
 
     /// Give the keyboard to whatever should have it now: the topmost layer surface

@@ -43,6 +43,8 @@ pub struct Surface {
     pub frame_pending: bool,
     /// Something changed since the last frame was queued.
     pub redraw_needed: bool,
+    /// A render is already scheduled for this turn of the event loop.
+    pub redraw_queued: bool,
 }
 
 /// An opened DRM device and everything hanging off it.
@@ -203,6 +205,7 @@ impl Tty {
             compositor,
             frame_pending: false,
             redraw_needed: true,
+            redraw_queued: false,
         });
 
         Ok(output)
