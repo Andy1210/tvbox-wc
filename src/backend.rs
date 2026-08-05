@@ -398,6 +398,18 @@ pub fn render(state: &mut crate::state::Tvbox) {
         FrameFlags::DEFAULT | FrameFlags::ALLOW_PRIMARY_PLANE_SCANOUT_ANY,
     ) {
         Ok(result) => {
+            // What the plane assignment actually decided, per element. This is the
+            // only honest answer to "why is this being composited"; the plane count
+            // cannot tell composition from scan-out.
+            if tracing::enabled!(tracing::Level::DEBUG) {
+                let decisions: Vec<_> = result
+                    .states
+                    .states
+                    .iter()
+                    .map(|(id, state)| format!("{:?}:{:?}", id, state.presentation_state))
+                    .collect();
+                debug!(?decisions, "plane assignment");
+            }
             if result.is_empty {
                 surface.redraw_needed = false;
             } else if let Err(err) = surface.compositor.queue_frame(()) {
