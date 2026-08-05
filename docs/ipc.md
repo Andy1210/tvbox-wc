@@ -43,6 +43,22 @@ again and fullscreen windows are reconfigured. A film already on a plane stays
 there, scaled by the display engine, which is why a mode change does not interrupt
 playback.
 
+### `set_hdr`
+
+```json
+{"id": 3, "request": "set_hdr", "output": "HDMIA-1", "on": true}
+{"id": 3, "ok": null}
+```
+
+A claim, not a setting. The colour space covers the whole output, so while it is
+held the SDR UI on its overlay plane is read as PQ. Claim it for the duration of PQ
+playback and release it after, the same way the mode is claimed.
+
+`get_outputs` reports `"hdr": {"supported": true, "on": false}`. `supported` means
+the driver exposes the connector properties a claim needs; it says nothing about
+the panel. Whether the TV can show HDR is in its EDID, which the shell already
+reads.
+
 ### Errors
 
 ```json

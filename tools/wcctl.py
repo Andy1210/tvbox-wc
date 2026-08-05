@@ -38,6 +38,12 @@ def main():
 
     command = sys.argv[1]
     payload = {"id": 1, "request": command}
+    if command == "set_hdr":
+        if len(sys.argv) < 4:
+            print("usage: wcctl.py set_hdr <output> <on|off>")
+            return 2
+        payload["output"] = sys.argv[2]
+        payload["on"] = sys.argv[3] in ("on", "true", "1")
     if command == "set_mode":
         if len(sys.argv) < 5:
             print("usage: wcctl.py set_mode <output> <w> <h> [refresh]")

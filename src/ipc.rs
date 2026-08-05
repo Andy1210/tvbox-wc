@@ -51,6 +51,16 @@ pub enum Request {
         #[serde(default)]
         refresh: Option<i32>,
     },
+    /// Claim the output's colour space for HDR content, or give it back.
+    ///
+    /// A claim, not a setting: the colour space covers the whole output, so an SDR
+    /// UI is read as PQ for as long as it is held.
+    SetHdr {
+        /// Connector name.
+        output: String,
+        /// Whether to claim it.
+        on: bool,
+    },
 }
 
 /// A mode, in the units the Wayland output protocol uses.
@@ -75,6 +85,20 @@ pub struct OutputInfo {
     pub current: Option<ModeInfo>,
     /// Every mode the connector advertises.
     pub modes: Vec<ModeInfo>,
+    /// Colour space state.
+    pub hdr: HdrInfo,
+}
+
+/// Whether HDR can be claimed on this output, and whether it is.
+#[derive(Debug, Serialize)]
+pub struct HdrInfo {
+    /// The driver exposes the connector properties a claim needs.
+    ///
+    /// This says nothing about the panel. Whether the TV can show HDR is in its
+    /// EDID, which the shell already reads.
+    pub supported: bool,
+    /// A claim is in effect.
+    pub on: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -231,6 +255,10 @@ fn dispatch(state: &mut Tvbox, request: Request) -> Result<serde_json::Value> {
             refresh,
         } => {
             state.set_mode(&output, w, h, refresh)?;
+            Ok(serde_json::Value::Null)
+        }
+        Request::SetHdr { output, on } => {
+            state.tty.set_hdr(&output, on)?;
             Ok(serde_json::Value::Null)
         }
     }

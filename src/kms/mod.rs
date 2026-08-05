@@ -6,3 +6,4 @@
 //! feeding back upstream.
 
 pub mod framebuffer;
+pub mod hdr;

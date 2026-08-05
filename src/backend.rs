@@ -42,6 +42,8 @@ pub struct Surface {
     pub connector: connector::Handle,
     /// Plane assignment, swapchain and page flips.
     pub compositor: Compositor,
+    /// The connector's HDR properties, if the driver has them.
+    pub hdr: Option<crate::kms::hdr::HdrProperties>,
     /// A page flip is in flight; the next render waits for its vblank.
     pub frame_pending: bool,
     /// Something changed since the last frame was queued.
@@ -203,9 +205,15 @@ impl Tty {
         )
         .context("DrmCompositor::new")?;
 
+        let hdr = crate::kms::hdr::HdrProperties::find(device.drm.device_fd(), connector.handle());
+        if hdr.is_none() {
+            info!("the connector exposes no HDR properties; HDR requests will be refused");
+        }
+
         device.surface = Some(Surface {
             crtc,
             connector: connector.handle(),
+            hdr,
             compositor,
             frame_pending: false,
             redraw_needed: true,
@@ -235,11 +243,60 @@ impl Tty {
             preferred: mode.mode_type().contains(ModeTypeFlags::PREFERRED),
         };
 
+        let (hdr_supported, hdr_on) = self.hdr_state();
         vec![crate::ipc::OutputInfo {
             name: format!("{:?}-{}", connector.interface(), connector.interface_id()),
             current: Some(describe(&current)),
             modes: connector.modes().iter().map(describe).collect(),
+            hdr: crate::ipc::HdrInfo {
+                supported: hdr_supported,
+                on: hdr_on,
+            },
         }]
+    }
+
+    /// Claim or release the output's colour space for HDR content.
+    pub fn set_hdr(&mut self, name: &str, on: bool) -> Result<()> {
+        let device = self
+            .device
+            .as_mut()
+            .ok_or_else(|| anyhow!("no device opened"))?;
+        let surface = device
+            .surface
+            .as_mut()
+            .ok_or_else(|| anyhow!("no output"))?;
+        let connector = device
+            .drm
+            .get_connector(surface.connector, false)
+            .context("failed to read the connector")?;
+
+        let output_name = format!("{:?}-{}", connector.interface(), connector.interface_id());
+        if output_name != name {
+            return Err(anyhow!("no output named {name}"));
+        }
+
+        let hdr = surface
+            .hdr
+            .as_mut()
+            .ok_or_else(|| anyhow!("this connector has no HDR properties"))?;
+        hdr.set(device.drm.device_fd(), surface.connector, on)?;
+        info!(output = name, on, "HDR claim");
+        Ok(())
+    }
+
+    /// Whether the output has a colour space claimed.
+    pub fn hdr_state(&self) -> (bool, bool) {
+        let Some(surface) = self
+            .device
+            .as_ref()
+            .and_then(|device| device.surface.as_ref())
+        else {
+            return (false, false);
+        };
+        match surface.hdr.as_ref() {
+            Some(hdr) => (true, hdr.claimed()),
+            None => (false, false),
+        }
     }
 
     /// Drive the output at a different mode.
