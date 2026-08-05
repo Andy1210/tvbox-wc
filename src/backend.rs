@@ -233,6 +233,23 @@ impl Tty {
         Ok(output)
     }
 
+    /// A mode's refresh in mHz, computed from its timings.
+    ///
+    /// `vrefresh()` is an integer, so it reports 24 for both 23.976 and 24 - two
+    /// modes a film must be able to tell apart, since playing 23.976 content on a
+    /// 24 Hz output judders with nothing dropped. This is the same arithmetic
+    /// wlr-randr prints.
+    fn refresh_mhz(mode: &drm::control::Mode) -> i32 {
+        refresh_mhz_from(
+            mode.clock(),
+            mode.hsync().2 as u32,
+            mode.vsync().2 as u32,
+            mode.flags().contains(drm::control::ModeFlags::INTERLACE),
+            mode.flags().contains(drm::control::ModeFlags::DBLSCAN),
+            mode.vrefresh(),
+        )
+    }
+
     /// What the output is doing and what it could do, for the shell.
     pub fn outputs(&self) -> Vec<crate::ipc::OutputInfo> {
         let Some(device) = self.device.as_ref() else {
@@ -249,7 +266,7 @@ impl Tty {
         let describe = |mode: &drm::control::Mode| crate::ipc::ModeInfo {
             w: mode.size().0 as i32,
             h: mode.size().1 as i32,
-            refresh: (mode.vrefresh() * 1000) as i32,
+            refresh: Self::refresh_mhz(mode),
             preferred: mode.mode_type().contains(ModeTypeFlags::PREFERRED),
         };
 
@@ -345,7 +362,8 @@ impl Tty {
             .iter()
             .filter(|mode| mode.size() == (w as u16, h as u16))
             .find(|mode| match refresh {
-                Some(wanted) => (mode.vrefresh() * 1000) as i32 == wanted,
+                // Within a millihertz: the shell round-trips what we reported.
+                Some(wanted) => (Self::refresh_mhz(mode) - wanted).abs() <= 1,
                 None => true,
             })
             .copied()
@@ -366,7 +384,7 @@ impl Tty {
         );
         Ok(OutputMode {
             size: (w, h).into(),
-            refresh: (mode.vrefresh() * 1000) as i32,
+            refresh: Self::refresh_mhz(&mode),
         })
     }
 
@@ -511,7 +529,7 @@ impl Tty {
         );
         Some(OutputMode {
             size: (wanted.size().0 as i32, wanted.size().1 as i32).into(),
-            refresh: (wanted.vrefresh() * 1000) as i32,
+            refresh: Self::refresh_mhz(&wanted),
         })
     }
 
@@ -528,6 +546,33 @@ impl Tty {
     pub fn is_active(&self) -> bool {
         self.session.is_active()
     }
+}
+
+/// A mode's refresh in mHz, from its timings.
+///
+/// Separate from the `Mode` it is read out of so it can be tested: drm-rs offers no
+/// way to build one, and this is the arithmetic that decides whether 23.976 and 24
+/// stay two modes.
+fn refresh_mhz_from(
+    clock_khz: u32,
+    htotal: u32,
+    vtotal: u32,
+    interlace: bool,
+    doublescan: bool,
+    vrefresh_fallback: u32,
+) -> i32 {
+    let per_frame = htotal as u64 * vtotal as u64;
+    if per_frame == 0 {
+        return (vrefresh_fallback * 1000) as i32;
+    }
+    let mut refresh = (clock_khz as u64 * 1_000_000 + per_frame / 2) / per_frame;
+    if interlace {
+        refresh *= 2;
+    }
+    if doublescan {
+        refresh /= 2;
+    }
+    refresh as i32
 }
 
 /// Any render node on the system, for hardware whose display device has none.
@@ -712,5 +757,36 @@ pub fn on_session_event(state: &mut crate::state::Tvbox, active: bool) {
         render(state);
     } else {
         device.drm.pause();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::refresh_mhz_from;
+
+    #[test]
+    fn refresh_comes_from_the_timings_not_the_rounded_field() {
+        // The two 1080p film modes an LG offers. They differ by 1000/1001, and the
+        // kernel's integer vrefresh calls both of them 24 - playing 23.976 content
+        // on a 24 Hz output judders with nothing dropped, so they must stay apart.
+        assert_eq!(refresh_mhz_from(74250, 2750, 1125, false, false, 24), 24000);
+        assert_eq!(refresh_mhz_from(74176, 2750, 1125, false, false, 24), 23976);
+    }
+
+    #[test]
+    fn the_panel_rate_that_is_not_quite_sixty() {
+        // 1360x768 on the box's LG: 60.015 Hz, which no integer field can carry.
+        assert_eq!(refresh_mhz_from(85500, 1792, 795, false, false, 60), 60015);
+    }
+
+    #[test]
+    fn interlace_and_doublescan_are_accounted_for() {
+        assert_eq!(refresh_mhz_from(74250, 2200, 1125, true, false, 60), 60000);
+        assert_eq!(refresh_mhz_from(74250, 2200, 1125, false, true, 15), 15000);
+    }
+
+    #[test]
+    fn a_mode_with_no_timings_falls_back_to_the_reported_rate() {
+        assert_eq!(refresh_mhz_from(0, 0, 0, false, false, 50), 50000);
     }
 }
