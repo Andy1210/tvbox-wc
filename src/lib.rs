@@ -117,21 +117,34 @@ pub fn run() -> Result<()> {
             "advertising dmabuf formats"
         );
         let scanout = state.tty.scanout_formats();
-        let scanout_node = state.tty.device_node();
         info!(
             scanout_formats = scanout.len(),
+            // The Pi's 10-bit decoder output is P030, and `drm-fourcc` has no such
+            // variant (P010/P012/P016 only), so smithay drops it when it reads the
+            // plane's IN_FORMATS and it can never appear here. That is what closes
+            // the 10-bit path, not our policy - see docs/measurements.md.
+            yuv = scanout
+                .iter()
+                .filter(|format| {
+                    matches!(
+                        format.code,
+                        smithay::backend::allocator::Fourcc::Nv12
+                            | smithay::backend::allocator::Fourcc::P010
+                    )
+                })
+                .count(),
             "advertising a scan-out tranche"
         );
 
+        // The tranche's target device is the RENDER node, the same one the main
+        // tranche names: a target device is where the client must be able to
+        // ALLOCATE, and it cannot allocate on the card node. The Scanout flag is what
+        // says these formats reach a plane; naming the card node instead just makes
+        // clients ignore the tranche, which is indistinguishable from not sending it.
         let mut builder = DmabufFeedbackBuilder::new(node.dev_id(), formats);
-        if let Some(scanout_node) = scanout_node {
-            if !scanout.is_empty() {
-                builder = builder.add_preference_tranche(
-                    scanout_node.dev_id(),
-                    Some(TrancheFlags::Scanout),
-                    scanout,
-                );
-            }
+        if !scanout.is_empty() {
+            builder =
+                builder.add_preference_tranche(node.dev_id(), Some(TrancheFlags::Scanout), scanout);
         }
         match builder.build() {
             Ok(feedback) => {

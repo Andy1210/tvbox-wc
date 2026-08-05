@@ -92,7 +92,7 @@ Consequences that bite:
 - A TV may advertise a DCI-4K mode (4096 wide) this hardware cannot drive. Use the
   preferred mode.
 
-## Open: 10-bit video is not offered to clients
+## Open: 10-bit video cannot even be named
 
 With everything above in place, a 10-bit film still fails before it starts:
 
@@ -100,17 +100,26 @@ With everything above in place, a 10-bit film still fails before it starts:
 [vo/dmabuf-wayland] Format 'P030' with modifier '(0700000000000004)' is not supported by the compositor.
 ```
 
-That is a **dmabuf feedback policy** question, not a framebuffer one. niri builds its
-scan-out tranche as `plane formats ∩ renderer formats`, which drops P030 (the GLES
-renderer cannot import it), and then strips every non-LINEAR modifier whenever the
-display device has no render node - which on a Pi is always. Both lines are
-reasonable defaults for a desktop and wrong here.
+The first answer was that this is a dmabuf feedback **policy** question - niri
+builds its scan-out tranche as `plane formats ∩ renderer formats`, which drops
+P030, and then strips non-LINEAR modifiers when the display device has no render
+node. Both are true, and both were fixed here: the tranche is built from the plane
+formats without intersecting the renderer's, and its target device is the render
+node (a target device is where a client must be able to **allocate**; naming the
+card node makes clients ignore the tranche entirely).
 
-This compositor has to decide it directly: advertise what the **planes** can scan
-out, and have an answer for the case where scan-out then fails and the renderer
-cannot composite the buffer either. The framebuffer path is already known to handle
-P030+SAND128 - the patched build creates the framebuffer, and labwc scans out
-exactly that buffer on the same hardware.
+It made no difference, and the reason is lower down: **`drm-fourcc` has no `P030`
+variant.** It knows P010, P012 and P016, and P030 - the Pi's 10-bit decoder
+output - is simply absent. Smithay converts the kernel's `IN_FORMATS` into
+`DrmFourcc`, so P030 is dropped there and can never reach a tranche, a plane
+assignment, or a framebuffer through the typed API. The kernel advertises it
+happily (`modetest -M vc4 -p` lists `P030: BROADCOM_SAND128` on the primary
+plane), and labwc scans out exactly that buffer on this hardware.
+
+So the 10-bit path needs a `drm-fourcc` that can name P030, and then Smithay's
+format tables (bpp, depth, opacity) taught about it. That is a small dependency
+patch rather than a design question - and worth sending upstream, since every
+Smithay compositor on a Pi hits it.
 
 ## Measurement discipline
 

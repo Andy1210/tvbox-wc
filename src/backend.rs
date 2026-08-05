@@ -215,6 +215,14 @@ impl Tty {
     /// whatever its renderer likes (BROADCOM_UIF here), no plane can take that
     /// buffer, and the compositor is back to compositing everything - including the
     /// film that was happily on the primary plane a moment earlier.
+    ///
+    /// Deliberately NOT intersected with what the renderer can import. The Pi's
+    /// 10-bit decoder output (P030 + BROADCOM_SAND128) is a format the planes take
+    /// and the GLES renderer does not, so intersecting drops exactly the format a
+    /// 4K HDR film arrives in - the client then never offers it and the whole
+    /// 10-bit path is closed. A tranche is a preference, not a promise: the main
+    /// tranche still carries the renderer's formats for a client that cannot use
+    /// this one.
     pub fn scanout_formats(&self) -> Vec<smithay::backend::allocator::Format> {
         let Some(device) = self.device.as_ref() else {
             return Vec::new();
@@ -223,17 +231,11 @@ impl Tty {
             return Vec::new();
         };
         let drm_surface = surface.compositor.surface();
-        let renderer_formats: std::collections::HashSet<_> =
-            device.renderer.dmabuf_formats().into_iter().collect();
-
         let planes = drm_surface.planes();
         let mut formats: Vec<smithay::backend::allocator::Format> =
             std::iter::once(drm_surface.plane_info())
                 .chain(planes.overlay.iter())
                 .flat_map(|plane| plane.formats.iter().copied())
-                // Keep only what we could also composite: a buffer we can neither scan
-                // out nor import is a black screen with no way back.
-                .filter(|format| renderer_formats.contains(format))
                 .collect();
         formats.sort_by_key(|format| (format.code as u32, u64::from(format.modifier)));
         formats.dedup();
