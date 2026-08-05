@@ -13,6 +13,7 @@
 pub mod kms;
 
 mod backend;
+mod cursor;
 mod input;
 mod ipc;
 mod render;

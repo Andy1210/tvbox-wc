@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Send a key the way a remote would, through a virtual input device.
+"""Send input the way a remote or a mouse would, through a virtual device.
 
-    fakeremote.py back        press and release KEY_BACK
+    fakeremote.py back            press and release KEY_BACK
     fakeremote.py enter
+    fakeremote.py move 200 150    move the pointer by that much
 
-The device is created with uinput, so it arrives through libinput exactly as a real
-remote does. Needs membership of the `input` group.
+The device is created with uinput, so it arrives through libinput exactly as real
+hardware does. Needs membership of the `input` group.
 """
 import sys
 import time
@@ -21,9 +22,29 @@ KEYS = {
 }
 
 
+def move(dx, dy):
+    capabilities = {
+        ecodes.EV_REL: [ecodes.REL_X, ecodes.REL_Y],
+        ecodes.EV_KEY: [ecodes.BTN_LEFT],
+    }
+    with UInput(capabilities, name="tvbox-fake-mouse") as device:
+        time.sleep(1.5)
+        # In steps, because a single large jump is one event and easy to miss.
+        for _ in range(10):
+            device.write(ecodes.EV_REL, ecodes.REL_X, dx // 10)
+            device.write(ecodes.EV_REL, ecodes.REL_Y, dy // 10)
+            device.syn()
+            time.sleep(0.03)
+        time.sleep(0.3)
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "move":
+        move(int(sys.argv[2]), int(sys.argv[3]))
+        return 0
+
     if len(sys.argv) < 2 or sys.argv[1] not in KEYS:
-        print(f"usage: fakeremote.py <{'|'.join(KEYS)}>")
+        print(f"usage: fakeremote.py <{'|'.join(KEYS)}|move dx dy>")
         return 2
 
     key = KEYS[sys.argv[1]]

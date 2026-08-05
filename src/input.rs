@@ -128,6 +128,10 @@ fn pointer_motion(state: &mut Tvbox, position: Point<f64, Logical>, time: u32) {
         },
     );
     pointer.frame(state);
+
+    // A pointer move commits nothing, so nothing else would ask for the frame that
+    // draws the cursor in its new place.
+    state.queue_redraw();
 }
 
 fn keyboard(state: &mut Tvbox, event: <LibinputInputBackend as InputBackend>::KeyboardKeyEvent) {

@@ -20,8 +20,9 @@ use smithay::backend::renderer::element::surface::{
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::gles::GlesRenderer;
 use smithay::desktop::{layer_map_for_output, Space, Window};
+use smithay::input::pointer::CursorImageStatus;
 use smithay::output::Output;
-use smithay::utils::{Physical, Point, Scale};
+use smithay::utils::{Logical, Physical, Point, Scale};
 use smithay::wayland::seat::WaylandFocus;
 use smithay::wayland::shell::wlr_layer::Layer;
 
@@ -33,9 +34,13 @@ pub fn elements(
     renderer: &mut GlesRenderer,
     space: &Space<Window>,
     output: &Output,
+    cursor: &CursorImageStatus,
+    pointer: Point<f64, Logical>,
 ) -> Vec<Element> {
     let scale = Scale::from(output.current_scale().fractional_scale());
-    let mut elements = Vec::new();
+    // The pointer is in front of everything, which is also the order the cursor
+    // plane sits in.
+    let mut elements = crate::cursor::elements(renderer, cursor, pointer, scale);
     let layers = layer_map_for_output(output);
 
     let push_layer_group =

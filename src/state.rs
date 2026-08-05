@@ -210,7 +210,13 @@ impl Tvbox {
             .device
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("no device opened"))?;
-        let elements = crate::render::elements(&mut device.renderer, &self.space, &output);
+        let elements = crate::render::elements(
+            &mut device.renderer,
+            &self.space,
+            &output,
+            &self.cursor_status,
+            self.pointer_location,
+        );
         crate::screenshot::capture(&mut device.renderer, &output, &elements, path)
     }
 

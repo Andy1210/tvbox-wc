@@ -528,7 +528,13 @@ pub fn render(state: &mut crate::state::Tvbox) {
         return;
     }
 
-    let elements = crate::render::elements(&mut device.renderer, &state.space, &output);
+    let elements = crate::render::elements(
+        &mut device.renderer,
+        &state.space,
+        &output,
+        &state.cursor_status,
+        state.pointer_location,
+    );
 
     trace!(elements = elements.len(), "rendering");
 
