@@ -43,7 +43,9 @@ use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::shell::wlr_layer::WlrLayerShellState;
 use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shm::ShmState;
+use smithay::wayland::input_method::InputMethodManagerState;
 use smithay::wayland::single_pixel_buffer::SinglePixelBufferState;
+use smithay::wayland::text_input::TextInputManagerState;
 use smithay::wayland::socket::ListeningSocketSource;
 use smithay::wayland::viewporter::ViewporterState;
 use tracing::{info, warn};
@@ -108,6 +110,14 @@ pub fn run() -> Result<()> {
     let _presentation =
         PresentationState::new::<Tvbox>(&display_handle, libc::CLOCK_MONOTONIC as u32);
     let _single_pixel = SinglePixelBufferState::new::<Tvbox>(&display_handle);
+    // The shell types into a focused field from its on-screen keyboard or a paired
+    // phone. Chromium acts on text-input-v3, so the compositor sends the text there
+    // rather than synthesising key events, which would need a keymap carrying every
+    // character in the string.
+    let _text_input = TextInputManagerState::new::<Tvbox>(&display_handle);
+    // Smithay only activates a text input while an input method exists, so one is
+    // advertised even though nothing else uses it.
+    let _input_method = InputMethodManagerState::new::<Tvbox, _>(&display_handle, |_client| true);
 
     state.tty.bind_wl_display(&display_handle);
     if let Some(node) = state.tty.render_node() {

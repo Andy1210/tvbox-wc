@@ -80,6 +80,29 @@ because the launcher handles it itself. The shell does this today with
 `sendInputEvent` in three separate places; here it happens once, for every client,
 including the ones that are not Electron.
 
+### `type_text`
+
+```json
+{"id": 7, "request": "type_text", "text": "arvizturo tukorfurogep"}
+{"id": 7, "ok": {"delivered": true}}
+```
+
+How the on-screen keyboard and a paired phone put text into a focused field. The
+alternative is synthesising key events, which needs an xkb keymap carrying every
+character in the string, generated per string.
+
+`delivered` says a client was there to take it, not that it appeared in the field.
+
+**Not finished.** The text reaches the client and Chromium enables its text input
+once the compositor sends `enter` (which it now does, tied to keyboard focus), but
+the field stays empty. Measured cause: smithay discards a client's `enable` while no
+input-method client is bound (`has_instance()` in `text_input_handle.rs`), so the
+text input never becomes "active" and `done` is never sent - and without `done` a
+client discards the committed string. Two ways out, neither taken yet: bind an
+input-method instance from inside the compositor, or change smithay so a compositor
+can serve text-input on its own. The generated-keymap route remains the fallback
+that needs no agreement from anybody.
+
 ### `screenshot`
 
 ```json

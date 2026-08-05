@@ -38,6 +38,11 @@ def main():
 
     command = sys.argv[1]
     payload = {"id": 1, "request": command}
+    if command == "type_text":
+        if len(sys.argv) < 3:
+            print("usage: wcctl.py type_text <text>")
+            return 2
+        payload["text"] = " ".join(sys.argv[2:])
     if command == "screenshot":
         payload["path"] = sys.argv[2] if len(sys.argv) > 2 else "/tmp/tvbox-wc.png"
     if command == "set_focus":

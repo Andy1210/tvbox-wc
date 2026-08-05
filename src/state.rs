@@ -39,6 +39,7 @@ use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
 };
 use smithay::wayland::shm::{ShmHandler, ShmState};
+use smithay::wayland::text_input::TextInputSeat;
 use smithay::{
     delegate_compositor, delegate_data_device, delegate_dmabuf, delegate_layer_shell,
     delegate_output, delegate_seat, delegate_shm, delegate_xdg_shell,
@@ -199,6 +200,27 @@ impl Tvbox {
         Ok(())
     }
 
+    /// Type a string into whatever field has the keyboard.
+    ///
+    /// This is how the on-screen keyboard and a paired phone deliver text. The
+    /// alternative is synthesising key events, which needs an xkb keymap carrying
+    /// every character in the string - accented Hungarian and password symbols
+    /// included - generated per string.
+    ///
+    /// Returns whether a client was there to take it.
+    pub fn type_text(&mut self, text: &str) -> bool {
+        let text_input = self.seat.text_input();
+        let mut delivered = false;
+        text_input.with_focused_text_input(|input, _surface| {
+            input.commit_string(Some(text.to_owned()));
+            delivered = true;
+        });
+        if delivered {
+            text_input.done(false);
+        }
+        delivered
+    }
+
     /// Render the scene to a PNG.
     pub fn screenshot(&mut self, path: &std::path::Path) -> anyhow::Result<(i32, i32)> {
         let output = self
@@ -301,6 +323,15 @@ impl Tvbox {
                 .next_back()
                 .and_then(|window| window.wl_surface().map(|s| s.into_owned()))
         });
+
+        // The text input follows the keyboard, and smithay does not wire that up:
+        // without `enter` a client has nothing to enable, so it ignores anything the
+        // compositor commits to it. That is what an empty field looks like when
+        // everything else is right.
+        let text_input = self.seat.text_input();
+        text_input.leave();
+        text_input.set_focus(target.clone());
+        text_input.enter();
 
         let serial = smithay::utils::SERIAL_COUNTER.next_serial();
         keyboard.set_focus(self, target, serial);
@@ -581,6 +612,22 @@ impl WlrLayerShellHandler for Tvbox {
     }
 }
 
+impl smithay::wayland::input_method::InputMethodHandler for Tvbox {
+    // No input method popup is expected: the on-screen keyboard is part of the
+    // shell's own UI, not a separate client, so there is nothing to place.
+    fn new_popup(&mut self, _surface: smithay::wayland::input_method::PopupSurface) {}
+
+    fn dismiss_popup(&mut self, _surface: smithay::wayland::input_method::PopupSurface) {}
+
+    fn popup_repositioned(&mut self, _surface: smithay::wayland::input_method::PopupSurface) {}
+
+    fn parent_geometry(&self, parent: &WlSurface) -> smithay::utils::Rectangle<i32, Logical> {
+        self.window_for_surface(parent)
+            .map(|window| window.geometry())
+            .unwrap_or_default()
+    }
+}
+
 impl DmabufHandler for Tvbox {
     fn dmabuf_state(&mut self) -> &mut DmabufState {
         &mut self.dmabuf_state
@@ -611,6 +658,8 @@ delegate_shm!(Tvbox);
 smithay::delegate_viewporter!(Tvbox);
 smithay::delegate_presentation!(Tvbox);
 smithay::delegate_single_pixel_buffer!(Tvbox);
+smithay::delegate_text_input_manager!(Tvbox);
+smithay::delegate_input_method_manager!(Tvbox);
 delegate_seat!(Tvbox);
 delegate_data_device!(Tvbox);
 delegate_output!(Tvbox);

@@ -53,6 +53,11 @@ pub enum Request {
     },
     /// What the compositor is currently told and doing.
     GetState,
+    /// Type a string into the focused field.
+    TypeText {
+        /// What to type.
+        text: String,
+    },
     /// Render the scene to a PNG, for looking at the screen from a terminal.
     Screenshot {
         /// Where to write it.
@@ -295,6 +300,10 @@ fn dispatch(state: &mut Tvbox, request: Request) -> Result<serde_json::Value> {
             Ok(serde_json::Value::Null)
         }
         Request::GetState => Ok(serde_json::json!({ "focus": state.focus })),
+        Request::TypeText { text } => {
+            let delivered = state.type_text(&text);
+            Ok(serde_json::json!({ "delivered": delivered }))
+        }
         Request::Screenshot { path } => {
             let (w, h) = state.screenshot(std::path::Path::new(&path))?;
             Ok(serde_json::json!({ "path": path, "w": w, "h": h }))

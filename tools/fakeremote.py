@@ -4,6 +4,7 @@
     fakeremote.py back            press and release KEY_BACK
     fakeremote.py enter
     fakeremote.py move 200 150    move the pointer by that much
+    fakeremote.py click 200 150   move there and click
 
 The device is created with uinput, so it arrives through libinput exactly as real
 hardware does. Needs membership of the `input` group.
@@ -38,7 +39,32 @@ def move(dx, dy):
         time.sleep(0.3)
 
 
+def click(dx, dy):
+    capabilities = {
+        ecodes.EV_REL: [ecodes.REL_X, ecodes.REL_Y],
+        ecodes.EV_KEY: [ecodes.BTN_LEFT],
+    }
+    with UInput(capabilities, name="tvbox-fake-mouse") as device:
+        time.sleep(1.5)
+        for _ in range(10):
+            device.write(ecodes.EV_REL, ecodes.REL_X, dx // 10)
+            device.write(ecodes.EV_REL, ecodes.REL_Y, dy // 10)
+            device.syn()
+            time.sleep(0.03)
+        time.sleep(0.2)
+        device.write(ecodes.EV_KEY, ecodes.BTN_LEFT, 1)
+        device.syn()
+        time.sleep(0.08)
+        device.write(ecodes.EV_KEY, ecodes.BTN_LEFT, 0)
+        device.syn()
+        time.sleep(0.3)
+
+
 def main():
+    if len(sys.argv) > 1 and sys.argv[1] == "click":
+        click(int(sys.argv[2]), int(sys.argv[3]))
+        return 0
+
     if len(sys.argv) > 1 and sys.argv[1] == "move":
         move(int(sys.argv[2]), int(sys.argv[3]))
         return 0
