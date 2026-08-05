@@ -89,6 +89,7 @@ pub fn run() -> Result<()> {
         seat,
         cursor_status: CursorImageStatus::default_named(),
         pointer_location: (0.0, 0.0).into(),
+        focus: Default::default(),
     };
 
     let output = state.tty.init_output()?;

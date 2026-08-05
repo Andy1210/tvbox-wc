@@ -28,7 +28,7 @@ use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::{Interest, LoopHandle, Mode, PostAction};
 use tracing::{debug, warn};
 
-use crate::state::Tvbox;
+use crate::state::{Focus, Tvbox};
 
 /// A request from the shell.
 #[derive(Debug, Deserialize)]
@@ -51,6 +51,19 @@ pub enum Request {
         #[serde(default)]
         refresh: Option<i32>,
     },
+    /// What the compositor is currently told and doing.
+    GetState,
+    /// Tell the compositor who owns the screen.
+    ///
+    /// It cannot work this out for itself: the launcher and an app can be windows
+    /// of the same process, and "an app is on screen" is the shell's own state.
+    SetFocus {
+        /// The launcher, or an app.
+        owner: FocusOwner,
+        /// Which app, when it is one.
+        #[serde(default)]
+        app: Option<String>,
+    },
     /// Claim the output's colour space for HDR content, or give it back.
     ///
     /// A claim, not a setting: the colour space covers the whole output, so an SDR
@@ -61,6 +74,16 @@ pub enum Request {
         /// Whether to claim it.
         on: bool,
     },
+}
+
+/// Who the shell says owns the screen.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FocusOwner {
+    /// The launcher's own UI.
+    Launcher,
+    /// An app.
+    App,
 }
 
 /// A mode, in the units the Wayland output protocol uses.
@@ -259,6 +282,15 @@ fn dispatch(state: &mut Tvbox, request: Request) -> Result<serde_json::Value> {
         }
         Request::SetHdr { output, on } => {
             state.tty.set_hdr(&output, on)?;
+            Ok(serde_json::Value::Null)
+        }
+        Request::GetState => Ok(serde_json::json!({ "focus": state.focus })),
+        Request::SetFocus { owner, app } => {
+            state.focus = match owner {
+                FocusOwner::Launcher => Focus::Launcher,
+                FocusOwner::App => Focus::App(app.unwrap_or_default()),
+            };
+            debug!(focus = ?state.focus, "focus reported by the shell");
             Ok(serde_json::Value::Null)
         }
     }

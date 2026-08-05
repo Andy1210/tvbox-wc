@@ -59,6 +59,27 @@ the driver exposes the connector properties a claim needs; it says nothing about
 the panel. Whether the TV can show HDR is in its EDID, which the shell already
 reads.
 
+### `set_focus` and `get_state`
+
+```json
+{"id": 4, "request": "set_focus", "owner": "app", "app": "plex"}
+{"id": 4, "ok": null}
+
+{"id": 5, "request": "get_state"}
+{"id": 5, "ok": {"focus": {"app": "plex"}}}
+```
+
+`owner` is `launcher` or `app`. The compositor cannot work this out for itself: the
+launcher and an app can be windows of the same process, and "an app is on screen"
+is the shell's own state machine rather than a property of any surface.
+
+It is not bookkeeping. The remote's Back key (`KEY_BACK`) reaches a web app as
+`BrowserBack`, and the app UIs the box runs only act on Backspace, so the key is
+rewritten while an app owns the screen and left alone while the launcher does,
+because the launcher handles it itself. The shell does this today with
+`sendInputEvent` in three separate places; here it happens once, for every client,
+including the ones that are not Electron.
+
 ### Errors
 
 ```json

@@ -38,6 +38,13 @@ def main():
 
     command = sys.argv[1]
     payload = {"id": 1, "request": command}
+    if command == "set_focus":
+        if len(sys.argv) < 3:
+            print("usage: wcctl.py set_focus <launcher|app> [app-id]")
+            return 2
+        payload["owner"] = sys.argv[2]
+        if len(sys.argv) > 3:
+            payload["app"] = sys.argv[3]
     if command == "set_hdr":
         if len(sys.argv) < 4:
             print("usage: wcctl.py set_hdr <output> <on|off>")

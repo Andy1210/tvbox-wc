@@ -11,13 +11,13 @@ use smithay::backend::input::{
 };
 use smithay::backend::libinput::{LibinputInputBackend, LibinputSessionInterface};
 use smithay::backend::session::libseat::LibSeatSession;
-use smithay::input::keyboard::{FilterResult, Keysym, ModifiersState};
+use smithay::input::keyboard::{FilterResult, Keycode, Keysym, ModifiersState};
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent};
 use smithay::reexports::input::Libinput;
 use smithay::utils::{Logical, Point, SERIAL_COUNTER};
-use tracing::info;
+use tracing::{debug, info};
 
-use crate::state::Tvbox;
+use crate::state::{Focus, Tvbox};
 
 /// Open libinput on the session's seat.
 pub fn init(session: &LibSeatSession, seat_name: &str) -> Result<LibinputInputBackend> {
@@ -136,7 +136,16 @@ fn keyboard(state: &mut Tvbox, event: <LibinputInputBackend as InputBackend>::Ke
     };
     let serial = SERIAL_COUNTER.next_serial();
     let time = event.time_msec();
-    let code = event.key_code();
+    let original = event.key_code();
+    let code = remap(original, &state.focus);
+    if code != original {
+        debug!(
+            from = u32::from(original),
+            to = u32::from(code),
+            focus = ?state.focus,
+            "remapped a key"
+        );
+    }
     let key_state = event.state();
     let running = state.running.clone();
 
@@ -160,4 +169,48 @@ fn keyboard(state: &mut Tvbox, event: <LibinputInputBackend as InputBackend>::Ke
 /// Ctrl+Alt+Backspace, the way out when there is no session manager to ask.
 fn is_quit(modifiers: &ModifiersState, keysym: Keysym) -> bool {
     modifiers.ctrl && modifiers.alt && keysym == Keysym::BackSpace
+}
+
+/// evdev's KEY_BACK and KEY_BACKSPACE, offset by 8 the way xkb counts keycodes.
+const KEY_BACK: u32 = 158 + 8;
+const KEY_BACKSPACE: u32 = 14 + 8;
+
+/// Rewrite the remote's Back key for apps that do not understand it.
+///
+/// A BT remote sends KEY_BACK, which reaches a web app as `BrowserBack`. The app
+/// UIs the box runs (the leanback YouTube UI, the Plex HTPC client) only act on
+/// Backspace, so today the shell swallows the key and re-injects one, in three
+/// separate places. Doing it here does it once, for every client, including the
+/// ones that are not Electron.
+///
+/// It cannot be unconditional: the launcher handles KEY_BACK itself, so the
+/// rewrite only applies while an app owns the screen. That is why the shell has to
+/// tell us which it is.
+fn remap(code: Keycode, focus: &Focus) -> Keycode {
+    match focus {
+        Focus::App(_) if u32::from(code) == KEY_BACK => Keycode::from(KEY_BACKSPACE),
+        _ => code,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn back_is_rewritten_only_for_an_app() {
+        let back = Keycode::from(KEY_BACK);
+        let app = Focus::App("plex".into());
+
+        assert_eq!(u32::from(remap(back, &app)), KEY_BACKSPACE);
+        assert_eq!(u32::from(remap(back, &Focus::Launcher)), KEY_BACK);
+    }
+
+    #[test]
+    fn other_keys_are_left_alone() {
+        let enter = Keycode::from(28u32 + 8);
+        for focus in [Focus::Launcher, Focus::App("plex".into())] {
+            assert_eq!(remap(enter, &focus), enter);
+        }
+    }
 }

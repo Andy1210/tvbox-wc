@@ -47,6 +47,21 @@ use tracing::{debug, warn};
 
 use crate::backend::Tty;
 
+/// Who owns the screen, as the shell reports it.
+///
+/// The compositor cannot work this out for itself: the launcher and an app can be
+/// windows of the same process, and "an app is on screen" is the shell's own state
+/// machine, not a property of any surface.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Focus {
+    /// The launcher's own UI.
+    #[default]
+    Launcher,
+    /// An app, named so logs and later per-app policy can tell them apart.
+    App(String),
+}
+
 /// Per-client state the compositor keeps.
 #[derive(Default)]
 pub struct ClientState {
@@ -92,6 +107,8 @@ pub struct Tvbox {
     pub cursor_status: CursorImageStatus,
     /// Where the pointer is, in output coordinates.
     pub pointer_location: Point<f64, Logical>,
+    /// What the shell says is on screen.
+    pub focus: Focus,
 }
 
 impl Tvbox {
