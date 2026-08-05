@@ -1,0 +1,12 @@
+/target
+Cargo.lock.orig
+
+# tools/ build products, including the generated protocol code
+tools/overlay
+tools/gbmprobe
+tools/*-protocol.c
+tools/*-client-protocol.h
+
+# test media is large and reproducible with ffmpeg (see tools/gpuprobe.sh)
+*.mkv
+*.mp4

@@ -1,0 +1,36 @@
+[package]
+name = "tvbox-wc"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Wayland compositor for the tvbox: the display engine composes, not the GPU"
+repository = "https://github.com/Andy1210/tvbox-wc"
+license = "MIT"
+keywords = ["wayland", "compositor", "smithay", "raspberry-pi", "kms"]
+categories = ["gui"]
+
+[dependencies]
+thiserror = "2.0"
+tracing = "0.1"
+
+# Pinned to a revision rather than a release: the DRM compositor's plane
+# assignment is what this project is built on, and it moves. Bump deliberately,
+# and re-run tools/gpuprobe.sh afterwards.
+[dependencies.smithay]
+git = "https://github.com/Smithay/smithay.git"
+rev = "ff5fa7df392cecfba049ffed55cdaa4e98a8e7ef"
+default-features = false
+features = [
+    "backend_drm",
+    "backend_egl",
+    "backend_gbm",
+    "backend_libinput",
+    "backend_session_libseat",
+    "backend_udev",
+    "renderer_gl",
+    "use_system_lib",
+    "wayland_frontend",
+]
+
+[profile.release]
+debug = "line-tables-only"
