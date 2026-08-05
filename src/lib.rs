@@ -11,3 +11,179 @@
 #![warn(missing_docs)]
 
 pub mod kms;
+
+mod backend;
+mod input;
+mod render;
+mod state;
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use anyhow::{Context as _, Result};
+use smithay::backend::session::libseat::LibSeatSession;
+use smithay::backend::session::Session;
+use smithay::input::keyboard::XkbConfig;
+use smithay::input::pointer::CursorImageStatus;
+use smithay::input::SeatState;
+use smithay::reexports::calloop::generic::Generic;
+use smithay::reexports::calloop::{EventLoop, Interest, Mode, PostAction};
+use smithay::reexports::wayland_server::{Display, DisplayHandle};
+use smithay::wayland::compositor::CompositorState;
+use smithay::wayland::dmabuf::{DmabufFeedbackBuilder, DmabufState};
+use smithay::wayland::output::OutputManagerState;
+use smithay::wayland::selection::data_device::DataDeviceState;
+use smithay::wayland::shell::wlr_layer::WlrLayerShellState;
+use smithay::wayland::shell::xdg::XdgShellState;
+use smithay::wayland::shm::ShmState;
+use smithay::wayland::socket::ListeningSocketSource;
+use smithay::wayland::viewporter::ViewporterState;
+use tracing::{info, warn};
+
+use crate::backend::Tty;
+use crate::state::{ClientState, Tvbox};
+
+/// Run the compositor until it is asked to stop.
+pub fn run() -> Result<()> {
+    let mut event_loop: EventLoop<Tvbox> = EventLoop::try_new().context("EventLoop::try_new")?;
+    let display: Display<Tvbox> = Display::new().context("Display::new")?;
+    let display_handle = display.handle();
+
+    let (session, session_notifier) =
+        LibSeatSession::new().context("failed to open a libseat session")?;
+    let seat_name = session.seat();
+
+    let mut tty = Tty::new(session.clone());
+    tty.open_device()?;
+
+    // One seat, made before the state so no second wl_seat global is ever created:
+    // a client that sees two seats picks one and may end up with neither keyboard
+    // nor pointer.
+    let mut seat_state = SeatState::<Tvbox>::new();
+    let mut seat = seat_state.new_wl_seat(&display_handle, seat_name.clone());
+    seat.add_keyboard(XkbConfig::default(), 200, 25)
+        .context("failed to add a keyboard")?;
+    seat.add_pointer();
+
+    let mut state = Tvbox {
+        running: Arc::new(AtomicBool::new(true)),
+        display_handle: display_handle.clone(),
+        loop_handle: event_loop.handle(),
+        tty,
+        output: None,
+        space: Default::default(),
+        popups: Default::default(),
+        compositor_state: CompositorState::new::<Tvbox>(&display_handle),
+        shm_state: ShmState::new::<Tvbox>(&display_handle, Vec::new()),
+        seat_state,
+        data_device_state: DataDeviceState::new::<Tvbox>(&display_handle),
+        xdg_shell_state: XdgShellState::new::<Tvbox>(&display_handle),
+        layer_shell_state: WlrLayerShellState::new::<Tvbox>(&display_handle),
+        dmabuf_state: DmabufState::new(),
+        dmabuf_global: None,
+        seat,
+        cursor_status: CursorImageStatus::default_named(),
+        pointer_location: (0.0, 0.0).into(),
+    };
+
+    let output = state.tty.init_output()?;
+    output.create_global::<Tvbox>(&display_handle);
+    state.space.map_output(&output, (0, 0));
+    state.output = Some(output);
+
+    let _output_manager = OutputManagerState::new_with_xdg_output::<Tvbox>(&display_handle);
+    // mpv's dmabuf output refuses to start without it.
+    let _viewporter = ViewporterState::new::<Tvbox>(&display_handle);
+
+    state.tty.bind_wl_display(&display_handle);
+    if let Some(node) = state.tty.render_node() {
+        let formats = state.tty.renderer_formats();
+        match DmabufFeedbackBuilder::new(node.dev_id(), formats).build() {
+            Ok(feedback) => {
+                let global = state
+                    .dmabuf_state
+                    .create_global_with_default_feedback::<Tvbox>(&display_handle, &feedback);
+                state.dmabuf_global = Some(global);
+            }
+            Err(err) => warn!(?err, "failed to build dmabuf feedback"),
+        }
+    }
+
+    // Event sources.
+    if let Some(notifier) = state.tty.notifier.take() {
+        event_loop
+            .handle()
+            .insert_source(notifier, |event, _, state| {
+                backend::on_drm_event(state, event);
+            })
+            .map_err(|err| anyhow::anyhow!("failed to insert the DRM source: {err}"))?;
+    }
+
+    event_loop
+        .handle()
+        .insert_source(session_notifier, |event, _, state| {
+            backend::on_session_event(
+                state,
+                matches!(event, smithay::backend::session::Event::ActivateSession),
+            );
+        })
+        .map_err(|err| anyhow::anyhow!("failed to insert the session source: {err}"))?;
+
+    let libinput = input::init(&session, &seat_name)?;
+    event_loop
+        .handle()
+        .insert_source(libinput, |event, _, state| {
+            input::handle(state, event);
+        })
+        .map_err(|err| anyhow::anyhow!("failed to insert the input source: {err}"))?;
+
+    let socket = ListeningSocketSource::new_auto().context("failed to bind a wayland socket")?;
+    let socket_name = socket.socket_name().to_os_string();
+    event_loop
+        .handle()
+        .insert_source(socket, move |stream, _, state| {
+            if let Err(err) = state
+                .display_handle
+                .insert_client(stream, Arc::new(ClientState::default()))
+            {
+                warn!(?err, "failed to accept a client");
+            }
+        })
+        .map_err(|err| anyhow::anyhow!("failed to insert the socket source: {err}"))?;
+
+    event_loop
+        .handle()
+        .insert_source(
+            Generic::new(display, Interest::READ, Mode::Level),
+            |_, display, state| {
+                // Safety: the display is not dropped while the loop runs.
+                unsafe { display.get_mut().dispatch_clients(state) }?;
+                Ok(PostAction::Continue)
+            },
+        )
+        .map_err(|err| anyhow::anyhow!("failed to insert the wayland source: {err}"))?;
+
+    unsafe { std::env::set_var("WAYLAND_DISPLAY", &socket_name) };
+    info!(socket = ?socket_name, "tvbox-wc is up");
+
+    backend::render(&mut state);
+
+    let running = state.running.clone();
+    event_loop
+        .run(Some(Duration::from_millis(16)), &mut state, |state| {
+            if !running.load(Ordering::SeqCst) {
+                state.loop_handle.insert_idle(|_| {});
+            }
+            state.space.refresh();
+            state.popups.cleanup();
+            state::refresh_primary_scanout_output(state);
+            let _ = state.display_handle.flush_clients();
+        })
+        .context("the event loop failed")?;
+
+    Ok(())
+}
+
+/// The display handle, for the few places that need one without the state.
+pub type Handle = DisplayHandle;

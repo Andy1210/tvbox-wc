@@ -24,19 +24,16 @@
 //! [`GbmFramebufferExporter`]: smithay::backend::drm::exporter::gbm::GbmFramebufferExporter
 
 use smithay::backend::allocator::{
-    Buffer, Fourcc, Format, Modifier,
-    dmabuf::Dmabuf,
-    format::get_opaque,
-    gbm::GbmBuffer,
+    dmabuf::Dmabuf, format::get_opaque, gbm::GbmBuffer, Buffer, Format, Fourcc, Modifier,
 };
 use smithay::backend::drm::{
-    DrmAccessError, DrmDeviceFd, Framebuffer,
     exporter::{ExportBuffer, ExportFramebuffer},
     gbm::framebuffer_from_bo,
+    DrmAccessError, DrmDeviceFd, Framebuffer,
 };
 use smithay::reexports::drm::{
     buffer::PlanarBuffer,
-    control::{Device as ControlDevice, FbCmd2Flags, framebuffer},
+    control::{framebuffer, Device as ControlDevice, FbCmd2Flags},
 };
 use tracing::{trace, warn};
 

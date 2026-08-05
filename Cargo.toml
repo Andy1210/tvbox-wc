@@ -10,8 +10,10 @@ keywords = ["wayland", "compositor", "smithay", "raspberry-pi", "kms"]
 categories = ["gui"]
 
 [dependencies]
+anyhow = "1.0"
 thiserror = "2.0"
 tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Pinned to a revision rather than a release: the DRM compositor's plane
 # assignment is what this project is built on, and it moves. Bump deliberately,
@@ -27,6 +29,7 @@ features = [
     "backend_libinput",
     "backend_session_libseat",
     "backend_udev",
+    "desktop",
     "renderer_gl",
     "use_system_lib",
     "wayland_frontend",
