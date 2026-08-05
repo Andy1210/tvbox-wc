@@ -207,18 +207,23 @@ impl Tvbox {
     /// every character in the string - accented Hungarian and password symbols
     /// included - generated per string.
     ///
-    /// Returns whether a client was there to take it.
-    pub fn type_text(&mut self, text: &str) -> bool {
+    /// Returns how many keys were sent.
+    ///
+    /// The text input is offered the string first, because a client that speaks the
+    /// protocol takes it whole and keeps its own idea of the caret. Whether it acts
+    /// on that is out of our hands, so the keys go out either way; see docs/ipc.md.
+    pub fn type_text(&mut self, text: &str) -> anyhow::Result<usize> {
         let text_input = self.seat.text_input();
-        let mut delivered = false;
+        let mut offered = false;
         text_input.with_focused_text_input(|input, _surface| {
             input.commit_string(Some(text.to_owned()));
-            delivered = true;
+            offered = true;
         });
-        if delivered {
+        if offered {
             text_input.done(false);
         }
-        delivered
+
+        crate::typing::type_text(self, text)
     }
 
     /// Render the scene to a PNG.

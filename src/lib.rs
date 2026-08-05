@@ -19,6 +19,7 @@ mod ipc;
 mod render;
 mod screenshot;
 mod state;
+mod typing;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;

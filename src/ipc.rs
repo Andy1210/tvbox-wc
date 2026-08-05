@@ -301,8 +301,8 @@ fn dispatch(state: &mut Tvbox, request: Request) -> Result<serde_json::Value> {
         }
         Request::GetState => Ok(serde_json::json!({ "focus": state.focus })),
         Request::TypeText { text } => {
-            let delivered = state.type_text(&text);
-            Ok(serde_json::json!({ "delivered": delivered }))
+            let keys = state.type_text(&text)?;
+            Ok(serde_json::json!({ "keys": keys }))
         }
         Request::Screenshot { path } => {
             let (w, h) = state.screenshot(std::path::Path::new(&path))?;

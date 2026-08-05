@@ -93,15 +93,20 @@ character in the string, generated per string.
 
 `delivered` says a client was there to take it, not that it appeared in the field.
 
-**Not finished.** The text reaches the client and Chromium enables its text input
-once the compositor sends `enter` (which it now does, tied to keyboard focus), but
-the field stays empty. Measured cause: smithay discards a client's `enable` while no
-input-method client is bound (`has_instance()` in `text_input_handle.rs`), so the
-text input never becomes "active" and `done` is never sent - and without `done` a
-client discards the committed string. Two ways out, neither taken yet: bind an
-input-method instance from inside the compositor, or change smithay so a compositor
-can serve text-input on its own. The generated-keymap route remains the fallback
-that needs no agreement from anybody.
+The string is typed as real key events. A keycode only produces what the keymap
+says, and no ordinary layout carries every character a password or an accented
+Hungarian name needs, so a keymap is generated for the string: one keycode per
+distinct character, that character on the first level, nothing else. It is loaded,
+the keys are sent, and the previous keymap is put back. Any client accepts this,
+because there is nothing to negotiate.
+
+`keys` is how many key presses went out.
+
+The focused client's text input is offered the same string first, for clients that
+speak text-input-v3 and would rather take it whole. Whether that lands is out of
+our hands: smithay discards a client's `enable` while no input-method client is
+bound, so the text input never becomes active and `done` is never sent. The keys go
+out either way, which is why typing works regardless.
 
 ### `screenshot`
 
