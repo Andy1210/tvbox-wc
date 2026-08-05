@@ -113,6 +113,11 @@ pub struct OutputInfo {
     pub current: Option<ModeInfo>,
     /// Every mode the connector advertises.
     pub modes: Vec<ModeInfo>,
+    /// Whether a display is attached right now.
+    ///
+    /// A TV that has been switched off reports false, and nothing is drawn until it
+    /// comes back.
+    pub connected: bool,
     /// Colour space state.
     pub hdr: HdrInfo,
 }

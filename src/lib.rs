@@ -27,6 +27,7 @@ use std::time::Duration;
 use anyhow::{Context as _, Result};
 use smithay::backend::session::libseat::LibSeatSession;
 use smithay::backend::session::Session;
+use smithay::backend::udev::{UdevBackend, UdevEvent};
 use smithay::input::keyboard::XkbConfig;
 use smithay::input::pointer::CursorImageStatus;
 use smithay::input::SeatState;
@@ -170,6 +171,17 @@ pub fn run() -> Result<()> {
             );
         })
         .map_err(|err| anyhow::anyhow!("failed to insert the session source: {err}"))?;
+
+    // A TV being switched off and on arrives as a udev change on the DRM device.
+    let udev = UdevBackend::new(&seat_name).context("failed to open the udev backend")?;
+    event_loop
+        .handle()
+        .insert_source(udev, |event, _, state| {
+            if let UdevEvent::Changed { .. } = event {
+                state.on_connector_change();
+            }
+        })
+        .map_err(|err| anyhow::anyhow!("failed to insert the udev source: {err}"))?;
 
     let libinput = input::init(&session, &seat_name)?;
     event_loop

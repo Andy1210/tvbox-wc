@@ -44,6 +44,14 @@ pub struct Surface {
     pub compositor: Compositor,
     /// The connector's HDR properties, if the driver has them.
     pub hdr: Option<crate::kms::hdr::HdrProperties>,
+    /// The mode the shell asked for, re-applied when the display comes back.
+    ///
+    /// A TV switched off and on again reconnects as a fresh connector, and the
+    /// default is to fall back to its preferred mode. That is how the display ends
+    /// up at 1360x768 in the middle of a film.
+    pub wanted_mode: Option<drm::control::Mode>,
+    /// The connector is currently disconnected, so there is nothing to draw on.
+    pub asleep: bool,
     /// A page flip is in flight; the next render waits for its vblank.
     pub frame_pending: bool,
     /// Something changed since the last frame was queued.
@@ -214,6 +222,8 @@ impl Tty {
             crtc,
             connector: connector.handle(),
             hdr,
+            wanted_mode: None,
+            asleep: false,
             compositor,
             frame_pending: false,
             redraw_needed: true,
@@ -248,6 +258,7 @@ impl Tty {
             name: format!("{:?}-{}", connector.interface(), connector.interface_id()),
             current: Some(describe(&current)),
             modes: connector.modes().iter().map(describe).collect(),
+            connected: self.awake(),
             hdr: crate::ipc::HdrInfo {
                 supported: hdr_supported,
                 on: hdr_on,
@@ -344,6 +355,7 @@ impl Tty {
             .compositor
             .use_mode(mode)
             .map_err(|err| anyhow!("failed to set the mode: {err}"))?;
+        surface.wanted_mode = Some(mode);
         surface.frame_pending = false;
         surface.redraw_needed = true;
 
@@ -439,6 +451,79 @@ impl Tty {
         }
     }
 
+    /// A connector changed state: the TV was switched off, or came back.
+    ///
+    /// Returns the mode now in use, if the output is alive, so the caller can put
+    /// the scene back on it.
+    pub fn on_connector_change(&mut self) -> Option<OutputMode> {
+        let device = self.device.as_mut()?;
+        let surface = device.surface.as_mut()?;
+        let connector = device.drm.get_connector(surface.connector, true).ok()?;
+        let connected = connector.state() == connector::State::Connected;
+
+        if !connected {
+            if !surface.asleep {
+                info!("the display went away");
+                surface.asleep = true;
+            }
+            return None;
+        }
+
+        if !surface.asleep {
+            return None;
+        }
+        info!("the display came back");
+        surface.asleep = false;
+
+        // Re-apply what the shell asked for if the display still offers it. Falling
+        // back to the preferred mode is what makes a TV that was switched off during
+        // a film come back at the wrong size.
+        let wanted = surface
+            .wanted_mode
+            .filter(|wanted| connector.modes().iter().any(|mode| mode == wanted))
+            .or_else(|| {
+                connector
+                    .modes()
+                    .iter()
+                    .find(|mode| mode.mode_type().contains(ModeTypeFlags::PREFERRED))
+                    .copied()
+            })
+            .or_else(|| connector.modes().first().copied())?;
+
+        if let Err(err) = surface.compositor.use_mode(wanted) {
+            warn!(?err, "failed to restore the mode");
+            return None;
+        }
+        if let Err(err) = surface.compositor.reset_state() {
+            warn!(?err, "failed to reset the compositor state");
+        }
+        surface.frame_pending = false;
+        surface.redraw_needed = true;
+
+        info!(
+            mode = format!(
+                "{}x{}@{}",
+                wanted.size().0,
+                wanted.size().1,
+                wanted.vrefresh()
+            ),
+            "restored the mode"
+        );
+        Some(OutputMode {
+            size: (wanted.size().0 as i32, wanted.size().1 as i32).into(),
+            refresh: (wanted.vrefresh() * 1000) as i32,
+        })
+    }
+
+    /// Whether the output has something to draw on.
+    pub fn awake(&self) -> bool {
+        self.device
+            .as_ref()
+            .and_then(|device| device.surface.as_ref())
+            .map(|surface| !surface.asleep)
+            .unwrap_or(false)
+    }
+
     /// Whether the session currently owns the device.
     pub fn is_active(&self) -> bool {
         self.session.is_active()
@@ -519,6 +604,9 @@ pub fn render(state: &mut crate::state::Tvbox) {
     let Some(surface) = device.surface.as_mut() else {
         return;
     };
+    if surface.asleep {
+        return;
+    }
     if surface.frame_pending || !surface.redraw_needed {
         trace!(
             frame_pending = surface.frame_pending,

@@ -220,6 +220,29 @@ impl Tvbox {
         crate::screenshot::capture(&mut device.renderer, &output, &elements, path)
     }
 
+    /// The display went away or came back.
+    ///
+    /// A TV switched off and on again is the ordinary case here, not an edge case:
+    /// the connector reappears and everything laid out against the output has to be
+    /// told the size again.
+    pub fn on_connector_change(&mut self) {
+        let Some(mode) = self.tty.on_connector_change() else {
+            return;
+        };
+        if let Some(output) = self.output.clone() {
+            output.change_current_state(Some(mode), None, None, None);
+            output.set_preferred(mode);
+            self.space.map_output(&output, (0, 0));
+            layer_map_for_output(&output).arrange();
+
+            let windows: Vec<Window> = self.space.elements().cloned().collect();
+            for window in windows {
+                self.fullscreen(&window);
+            }
+        }
+        self.queue_redraw();
+    }
+
     /// Ask for a frame. Nothing else schedules one: without damage the compositor
     /// sits still, which is the point, but it also means every change has to say so.
     ///
