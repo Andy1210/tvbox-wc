@@ -267,12 +267,6 @@ impl Tty {
         render_node_on_the_system().or(card)
     }
 
-    /// The card node the output lives on, which is where a buffer must be able to
-    /// be scanned out.
-    pub fn device_node(&self) -> Option<DrmNode> {
-        DrmNode::from_file(self.device.as_ref()?.gbm.as_fd()).ok()
-    }
-
     /// Check that a client's dmabuf is at least renderable.
     pub fn import_dmabuf(&mut self, dmabuf: &Dmabuf) -> Result<()> {
         let device = self
