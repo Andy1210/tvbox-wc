@@ -92,7 +92,23 @@ Consequences that bite:
 - A TV may advertise a DCI-4K mode (4096 wide) this hardware cannot drive. Use the
   preferred mode.
 
-## Open: 10-bit video cannot even be named
+## 10-bit video: the format could not be named
+
+**Resolved.** With the fix below, a 10-bit film plays with its own P030 buffer on
+the primary plane and a translucent fullscreen UI on an overlay plane, compositor
+at 0 ms/s, 0 dropped frames.
+
+The fix is one line of `Cargo.toml`: `drm-fourcc` gained P030 when its enums were
+regenerated on kernel 6.15.9, but there has been no crates.io release since 2.2.0
+in 2021, so the crate every Smithay build resolves to cannot name the format. We
+pin the crate to the upstream git revision until a release lands
+(danielzfranklin/drm-fourcc-rs#31 already asks for one). Smithay itself needs no
+change: `has_alpha` answers false for a format it does not list, which is right
+for P030, and `get_bpp`/`get_depth` are only used by the legacy AddFB fallback
+that the direct exporter never takes.
+
+The rest of this section is what it took to find that, kept because two plausible
+answers came first and both were wrong.
 
 With everything above in place, a 10-bit film still fails before it starts:
 
@@ -108,18 +124,17 @@ formats without intersecting the renderer's, and its target device is the render
 node (a target device is where a client must be able to **allocate**; naming the
 card node makes clients ignore the tranche entirely).
 
-It made no difference, and the reason is lower down: **`drm-fourcc` has no `P030`
-variant.** It knows P010, P012 and P016, and P030 - the Pi's 10-bit decoder
-output - is simply absent. Smithay converts the kernel's `IN_FORMATS` into
-`DrmFourcc`, so P030 is dropped there and can never reach a tranche, a plane
-assignment, or a framebuffer through the typed API. The kernel advertises it
+It made no difference, and the reason is lower down: the released **`drm-fourcc`
+has no `P030` variant.** It knows P010, P012 and P016, and P030 - the Pi's 10-bit
+decoder output - is simply absent. Smithay converts the kernel's `IN_FORMATS`
+into `DrmFourcc`, so P030 was dropped there and could never reach a tranche, a
+plane assignment or a framebuffer through the typed API. The kernel advertises it
 happily (`modetest -M vc4 -p` lists `P030: BROADCOM_SAND128` on the primary
 plane), and labwc scans out exactly that buffer on this hardware.
 
-So the 10-bit path needs a `drm-fourcc` that can name P030, and then Smithay's
-format tables (bpp, depth, opacity) taught about it. That is a small dependency
-patch rather than a design question - and worth sending upstream, since every
-Smithay compositor on a Pi hits it.
+Both tranche corrections were still right, and both are kept: the intersection
+dropped formats that exist to be scanned out, and a tranche naming a device the
+client cannot allocate on is ignored wholesale.
 
 ## Measurement discipline
 

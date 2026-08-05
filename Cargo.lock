@@ -210,8 +210,7 @@ dependencies = [
 [[package]]
 name = "drm-fourcc"
 version = "2.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0aafbcdb8afc29c1a7ee5fbe53b5d62f4565b35a042a662ca9fecd0b54dae6f4"
+source = "git+https://github.com/danielzfranklin/drm-fourcc-rs?rev=1ad1a978a9aaa78ff0016cc7013787e4d1d68682#1ad1a978a9aaa78ff0016cc7013787e4d1d68682"
 
 [[package]]
 name = "drm-sys"

@@ -119,19 +119,9 @@ pub fn run() -> Result<()> {
         let scanout = state.tty.scanout_formats();
         info!(
             scanout_formats = scanout.len(),
-            // The Pi's 10-bit decoder output is P030, and `drm-fourcc` has no such
-            // variant (P010/P012/P016 only), so smithay drops it when it reads the
-            // plane's IN_FORMATS and it can never appear here. That is what closes
-            // the 10-bit path, not our policy - see docs/measurements.md.
-            yuv = scanout
+            p030 = scanout
                 .iter()
-                .filter(|format| {
-                    matches!(
-                        format.code,
-                        smithay::backend::allocator::Fourcc::Nv12
-                            | smithay::backend::allocator::Fourcc::P010
-                    )
-                })
+                .filter(|format| format.code == smithay::backend::allocator::Fourcc::P030)
                 .count(),
             "advertising a scan-out tranche"
         );

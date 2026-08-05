@@ -38,3 +38,11 @@ features = [
 
 [profile.release]
 debug = "line-tables-only"
+
+# The Pi's 10-bit decoder output is P030, and the last drm-fourcc release (2.2.0,
+# 2021) has no such variant, so smithay drops the format when it reads a plane's
+# IN_FORMATS and 10-bit video can never reach a plane. It was added upstream when
+# the enums were regenerated on 6.15.9; there has been no release since
+# (danielzfranklin/drm-fourcc-rs#31). Drop this once one lands.
+[patch.crates-io]
+drm-fourcc = { git = "https://github.com/danielzfranklin/drm-fourcc-rs", rev = "1ad1a978a9aaa78ff0016cc7013787e4d1d68682" }
