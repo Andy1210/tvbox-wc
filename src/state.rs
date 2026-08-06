@@ -19,7 +19,7 @@ use smithay::reexports::calloop::LoopHandle;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::protocol::{wl_seat, wl_surface::WlSurface};
 use smithay::reexports::wayland_server::{Client, DisplayHandle};
-use smithay::utils::{Logical, Point, Rectangle, Serial};
+use smithay::utils::{IsAlive, Logical, Point, Rectangle, Serial};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
     get_parent, is_sync_subsurface, with_states, CompositorClientState, CompositorHandler,
@@ -36,6 +36,7 @@ use smithay::wayland::shell::wlr_layer::{
     Layer, LayerSurface as WlrLayerSurface, WlrLayerShellHandler, WlrLayerShellState,
 };
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
+use smithay::wayland::idle_inhibit::{IdleInhibitHandler, IdleInhibitManagerState};
 use smithay::wayland::shell::xdg::decoration::{XdgDecorationHandler, XdgDecorationState};
 use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
@@ -44,7 +45,8 @@ use smithay::wayland::shm::{ShmHandler, ShmState};
 use smithay::wayland::text_input::TextInputSeat;
 use smithay::{
     delegate_compositor, delegate_data_device, delegate_dmabuf, delegate_layer_shell,
-    delegate_output, delegate_seat, delegate_shm, delegate_xdg_decoration, delegate_xdg_shell,
+    delegate_idle_inhibit, delegate_output, delegate_seat, delegate_shm, delegate_xdg_decoration,
+    delegate_xdg_shell,
 };
 use tracing::{debug, info, warn};
 
@@ -103,6 +105,13 @@ pub struct Tvbox {
     /// request with the same mode, since this compositor draws no decorations.
     #[allow(dead_code)]
     pub xdg_decoration_state: XdgDecorationState,
+    /// Held for its global; the inhibiting surfaces are tracked below.
+    #[allow(dead_code)]
+    pub idle_inhibit_state: IdleInhibitManagerState,
+    /// Surfaces asking the box to stay awake. A game or a film says so here, and
+    /// the shell can ask over the control socket rather than guessing from what is
+    /// on screen.
+    pub idle_inhibitors: Vec<WlSurface>,
     pub layer_shell_state: WlrLayerShellState,
     pub dmabuf_state: DmabufState,
     /// The dmabuf global, once the renderer's formats are known.
@@ -377,6 +386,14 @@ impl Tvbox {
         });
     }
 
+    /// Is anything asking the box to stay awake? Dead surfaces are dropped here
+    /// rather than in the handler: a client that exits without releasing its
+    /// inhibitor - a crash, a kill - would otherwise hold it for the session.
+    pub fn idle_inhibited(&mut self) -> bool {
+        self.idle_inhibitors.retain(|surface| surface.alive());
+        !self.idle_inhibitors.is_empty()
+    }
+
     /// Give the keyboard to whatever should have it now: the topmost layer surface
     /// that asked for it, otherwise the frontmost window.
     pub fn refresh_keyboard_focus(&mut self) {
@@ -617,6 +634,24 @@ impl DataDeviceHandler for Tvbox {
 // grab.
 impl WaylandDndGrabHandler for Tvbox {}
 
+/// Whether anything on screen is asking the box to stay awake.
+///
+/// A player or a game says so with this protocol, and what it saves is not just an
+/// idle timer: without the protocol a client falls back to asking over D-Bus, and
+/// RetroArch's fallback blocks for the full 25-second D-Bus timeout before the
+/// game starts - measured on the box, and the whole of a startup that felt broken.
+impl IdleInhibitHandler for Tvbox {
+    fn inhibit(&mut self, surface: WlSurface) {
+        if !self.idle_inhibitors.contains(&surface) {
+            self.idle_inhibitors.push(surface);
+        }
+    }
+
+    fn uninhibit(&mut self, surface: WlSurface) {
+        self.idle_inhibitors.retain(|s| *s != surface);
+    }
+}
+
 /// Decorations are the compositor's, and there are none.
 ///
 /// Advertising this at all is what matters: a client that finds no decoration
@@ -805,6 +840,7 @@ delegate_data_device!(Tvbox);
 delegate_output!(Tvbox);
 delegate_xdg_shell!(Tvbox);
 delegate_xdg_decoration!(Tvbox);
+delegate_idle_inhibit!(Tvbox);
 delegate_layer_shell!(Tvbox);
 delegate_dmabuf!(Tvbox);
 

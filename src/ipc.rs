@@ -343,7 +343,12 @@ fn dispatch(state: &mut Tvbox, request: Request) -> Result<serde_json::Value> {
             state.tty.set_hdr(&output, on)?;
             Ok(serde_json::Value::Null)
         }
-        Request::GetState => Ok(serde_json::json!({ "focus": state.focus })),
+        Request::GetState => Ok(serde_json::json!({
+            "focus": state.focus,
+            // Something on screen is asking the box to stay awake - a game, a
+            // player. The shell's ambient screen is the thing that should honour it.
+            "idle_inhibited": state.idle_inhibited(),
+        })),
         Request::PlaceWindow { app_id, x, y, w, h } => {
             let rect = match (x, y, w, h) {
                 (Some(x), Some(y), Some(w), Some(h)) if w > 0 && h > 0 => {

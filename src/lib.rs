@@ -46,6 +46,7 @@ use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::presentation::PresentationState;
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::shell::wlr_layer::WlrLayerShellState;
+use smithay::wayland::idle_inhibit::IdleInhibitManagerState;
 use smithay::wayland::shell::xdg::decoration::XdgDecorationState;
 use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shm::ShmState;
@@ -98,6 +99,11 @@ pub fn run(options: cli::Options) -> Result<()> {
         // toolkits that do reach for libdecor, and RetroArch hangs in it here
         // before it ever creates a window.
         xdg_decoration_state: XdgDecorationState::new::<Tvbox>(&display_handle),
+        // A client that cannot ask for this over Wayland asks over D-Bus instead,
+        // and RetroArch's fallback waits out the full 25-second D-Bus timeout
+        // before the game starts.
+        idle_inhibit_state: IdleInhibitManagerState::new::<Tvbox>(&display_handle),
+        idle_inhibitors: Vec::new(),
         layer_shell_state: WlrLayerShellState::new::<Tvbox>(&display_handle),
         dmabuf_state: DmabufState::new(),
         dmabuf_global: None,
