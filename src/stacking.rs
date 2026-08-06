@@ -26,13 +26,21 @@ fn shell_app_id() -> String {
     std::env::var("TVBOX_SHELL_APP_ID").unwrap_or_else(|_| SHELL_APP_ID.to_owned())
 }
 
-/// A window's app id, latched the first time it is asked for.
+/// A window's app id, latched the first time the client presents one.
 ///
 /// `xdg_toplevel.set_app_id` can be sent at any time, and two decisions here key off
 /// the answer: which windows stay in front, and where a placed window goes. Reading
 /// it live would let a client walk in front of the shell by renaming itself to
 /// `tvbox-shell` after mapping, or escape a picture-in-picture rectangle by renaming
 /// itself out of it. The first answer is the one that counts.
+///
+/// What is NOT an answer is silence. A toplevel exists before its client has sent
+/// anything about it - `set_app_id` is a separate request, and this compositor asks
+/// the question the moment the toplevel appears, to work out who should hold the
+/// keyboard. Latching that emptiness left every window unnamed for the rest of its
+/// life, and with no window matching the shell's id the rule below has nothing to
+/// keep in front: a film covered the UI that is supposed to be over it, and took the
+/// remote with it.
 ///
 /// This is not a security boundary - a client that maps with the shell's app id from
 /// the start still joins that group, and on this box every Wayland client is
@@ -42,21 +50,26 @@ pub fn app_id(window: &Window) -> Option<String> {
     let surface = window.wl_surface()?;
     with_states(&surface, |states| {
         let latched = states.data_map.get_or_insert(LatchedAppId::default);
-        if let Some(id) = latched.0.borrow().as_ref() {
-            return id.clone();
-        }
+        let mut remembered = latched.0.borrow_mut();
         let committed = states
             .data_map
             .get::<XdgToplevelSurfaceData>()
             .and_then(|data| data.lock().ok().and_then(|data| data.app_id.clone()));
-        *latched.0.borrow_mut() = Some(committed.clone());
-        committed
+        latch(&mut remembered, committed)
     })
+}
+
+/// Keep the first name a client presents, and answer with it from then on.
+fn latch(remembered: &mut Option<String>, committed: Option<String>) -> Option<String> {
+    if remembered.is_none() {
+        *remembered = committed;
+    }
+    remembered.clone()
 }
 
 /// The app id a window first presented, kept per surface.
 #[derive(Default)]
-struct LatchedAppId(std::cell::RefCell<Option<Option<String>>>);
+struct LatchedAppId(std::cell::RefCell<Option<String>>);
 
 /// Back to front: everything else first, the shell's windows last.
 pub fn stacked(space: &Space<Window>) -> Vec<Window> {
@@ -107,6 +120,22 @@ mod tests {
             ("retroarch", false),
         ]);
         assert_eq!(order, vec!["mpv", "retroarch", "shell", "popup"]);
+    }
+
+    #[test]
+    fn a_window_that_has_not_named_itself_is_asked_again() {
+        // The toplevel exists before set_app_id arrives, and the keyboard question is
+        // asked in between. Remembering that silence unnames the window forever.
+        let mut remembered = None;
+        assert_eq!(latch(&mut remembered, None), None);
+        assert_eq!(latch(&mut remembered, Some("tvbox-shell".into())), Some("tvbox-shell".into()));
+    }
+
+    #[test]
+    fn the_first_name_is_the_one_that_counts() {
+        let mut remembered = None;
+        latch(&mut remembered, Some("mpv".into()));
+        assert_eq!(latch(&mut remembered, Some("tvbox-shell".into())), Some("mpv".into()));
     }
 
     #[test]

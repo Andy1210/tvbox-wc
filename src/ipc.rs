@@ -27,6 +27,7 @@ use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::{Interest, LoopHandle, Mode, PostAction};
+use smithay::wayland::seat::WaylandFocus as _;
 use tracing::{debug, warn};
 
 use crate::state::{Focus, Tvbox};
@@ -343,12 +344,32 @@ fn dispatch(state: &mut Tvbox, request: Request) -> Result<serde_json::Value> {
             state.tty.set_hdr(&output, on)?;
             Ok(serde_json::Value::Null)
         }
-        Request::GetState => Ok(serde_json::json!({
-            "focus": state.focus,
-            // Something on screen is asking the box to stay awake - a game, a
-            // player. The shell's ambient screen is the thing that should honour it.
-            "idle_inhibited": state.idle_inhibited(),
-        })),
+        Request::GetState => {
+            // Back to front, with the one that holds the keyboard marked. What is on
+            // screen and what answers the remote are decided here and nowhere else,
+            // so when a key goes somewhere unexpected this is the question to ask.
+            let focused = state
+                .seat
+                .get_keyboard()
+                .and_then(|keyboard| keyboard.current_focus());
+            let windows: Vec<serde_json::Value> = crate::stacking::stacked(&state.space)
+                .iter()
+                .map(|window| {
+                    let surface = window.wl_surface().map(|s| s.into_owned());
+                    serde_json::json!({
+                        "app_id": crate::stacking::app_id(window),
+                        "keyboard": surface.is_some() && surface == focused,
+                    })
+                })
+                .collect();
+            Ok(serde_json::json!({
+                "focus": state.focus,
+                // Something on screen is asking the box to stay awake - a game, a
+                // player. The shell's ambient screen is the thing that should honour it.
+                "idle_inhibited": state.idle_inhibited(),
+                "windows": windows,
+            }))
+        }
         Request::PlaceWindow { app_id, x, y, w, h } => {
             let rect = match (x, y, w, h) {
                 (Some(x), Some(y), Some(w), Some(h)) if w > 0 && h > 0 => {

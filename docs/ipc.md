@@ -66,8 +66,21 @@ reads.
 {"id": 4, "ok": null}
 
 {"id": 5, "request": "get_state"}
-{"id": 5, "ok": {"focus": {"app": "plex"}}}
+{"id": 5, "ok": {
+  "focus": {"app": "plex"},
+  "idle_inhibited": true,
+  "windows": [
+    {"app_id": "mpv", "keyboard": false},
+    {"app_id": "tvbox-shell", "keyboard": true}
+  ]
+}}
 ```
+
+`windows` is back to front, so the last entry is the one on top, and `keyboard`
+marks the surface that receives key events. Both answers come from the same rule
+that decides what is drawn over what, which makes this the question to ask when a
+key ends up somewhere unexpected: a film that answers the remote is a film that is
+in front of the UI, whatever the screen looks like.
 
 `owner` is `launcher` or `app`. The compositor cannot work this out for itself: the
 launcher and an app can be windows of the same process, and "an app is on screen"
