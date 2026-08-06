@@ -19,6 +19,7 @@
 //! could reach this socket can already reach the compositor's Wayland socket.
 
 use std::io::{ErrorKind, Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 
@@ -174,6 +175,12 @@ struct Envelope {
     request: Request,
 }
 
+/// The longest request line accepted. Requests are small - the largest carries a
+/// string to type - and a peer that never sends a newline would otherwise grow this
+/// process at socket speed until the box's OOM killer picks the biggest thing on it,
+/// which is the compositor.
+const MAX_LINE: usize = 64 * 1024;
+
 /// Start listening, and return the path so it can be handed to children.
 pub fn listen(loop_handle: &LoopHandle<'static, Tvbox>, path: PathBuf) -> Result<PathBuf> {
     // A socket left behind by a compositor that did not shut down cleanly would
@@ -181,6 +188,16 @@ pub fn listen(loop_handle: &LoopHandle<'static, Tvbox>, path: PathBuf) -> Result
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)
         .with_context(|| format!("failed to bind the control socket at {}", path.display()))?;
+    // Owner only. This socket sets the output mode, types keys and takes
+    // screenshots, and its usual home ($XDG_RUNTIME_DIR) is already 0700 - but the
+    // fallback is not, and a socket inherits the umask rather than choosing. State
+    // the permission instead of depending on where it landed.
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).with_context(|| {
+        format!(
+            "failed to restrict the control socket at {}",
+            path.display()
+        )
+    })?;
     listener
         .set_nonblocking(true)
         .context("failed to make the control socket non-blocking")?;
@@ -239,7 +256,16 @@ pub fn register_pending(state: &mut Tvbox) {
                 loop {
                     match (&**stream).read(&mut chunk) {
                         Ok(0) => return Ok(PostAction::Remove),
-                        Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+                        Ok(n) => {
+                            buffer.extend_from_slice(&chunk[..n]);
+                            if buffer.len() > MAX_LINE && !buffer.contains(&b'\n') {
+                                warn!(
+                                    bytes = buffer.len(),
+                                    "a control connection sent no newline - dropping it"
+                                );
+                                return Ok(PostAction::Remove);
+                            }
+                        }
                         Err(err) if err.kind() == ErrorKind::WouldBlock => break,
                         Err(err) if err.kind() == ErrorKind::Interrupted => continue,
                         Err(err) => {

@@ -19,8 +19,18 @@ use std::fmt::Write as _;
 
 use smithay::input::keyboard::{KeyboardHandle, Keycode, XkbConfig};
 use smithay::utils::SERIAL_COUNTER;
+use tracing::error;
 
 use crate::state::Tvbox;
+
+/// The longest string this will type.
+///
+/// Not a protocol limit but a physical one: every character becomes a press and a
+/// release, each serialised into the focused client's buffer before the event loop
+/// gets another turn, so a caller asking for a megabyte freezes the picture and the
+/// remote while it is delivered. The shell's own limit is 400 characters (a login
+/// field, not a document).
+const MAX_TEXT: usize = 4096;
 
 /// xkb counts keycodes from 8, and 8 itself is reserved.
 const FIRST_KEYCODE: u32 = 9;
@@ -135,6 +145,10 @@ pub fn type_text(state: &mut Tvbox, text: &str, select_all: bool) -> anyhow::Res
     if text.is_empty() {
         return Ok(0);
     }
+    let characters = text.chars().count();
+    if characters > MAX_TEXT {
+        anyhow::bail!("{characters} characters is more than this will type at once");
+    }
     let Some(keyboard) = state.seat.get_keyboard() else {
         anyhow::bail!("the seat has no keyboard");
     };
@@ -153,9 +167,28 @@ pub fn type_text(state: &mut Tvbox, text: &str, select_all: bool) -> anyhow::Res
     // client's side before these arrive.
     send(state, &keyboard, &strokes_for(&keys));
 
-    keyboard
-        .set_xkb_config(state, XkbConfig::default())
-        .map_err(|err| anyhow::anyhow!("failed to restore the keymap: {err}"))?;
+    // Restoring matters more than typing did. The generated keymap has one keycode
+    // per character of THIS string and NoSymbol everywhere else, so a seat left on
+    // it is a remote that does nothing at all - and set_xkb_config compiles from
+    // RMLVO names, which can fail for reasons that have nothing to do with us (an
+    // unattended upgrade replacing xkb-data underneath). So: try the same layout
+    // again, then the barest keymap that can exist, and say so loudly either way.
+    if let Err(err) = keyboard.set_xkb_config(state, XkbConfig::default()) {
+        error!(?err, "failed to restore the keymap - retrying");
+        if let Err(err) = keyboard.set_xkb_config(state, XkbConfig::default()) {
+            error!(
+                ?err,
+                "still cannot restore the keymap - falling back to a plain us layout"
+            );
+            let plain = XkbConfig {
+                layout: "us",
+                ..Default::default()
+            };
+            keyboard.set_xkb_config(state, plain).map_err(|err| {
+                anyhow::anyhow!("the seat is left on the generated keymap: {err}")
+            })?;
+        }
+    }
 
     Ok(keys.len())
 }

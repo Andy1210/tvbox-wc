@@ -44,7 +44,7 @@ use smithay::{
     delegate_compositor, delegate_data_device, delegate_dmabuf, delegate_layer_shell,
     delegate_output, delegate_seat, delegate_shm, delegate_xdg_shell,
 };
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::backend::Tty;
 
@@ -299,6 +299,25 @@ impl Tvbox {
     /// the connector reappears and everything laid out against the output has to be
     /// told the size again.
     pub fn on_connector_change(&mut self) {
+        // Nothing was plugged in when we started, so this may be the display
+        // arriving. Bring it up here rather than at startup only.
+        if self.output.is_none() {
+            match self.tty.init_output() {
+                Ok(Some(output)) => {
+                    output.create_global::<Tvbox>(&self.display_handle);
+                    self.space.map_output(&output, (0, 0));
+                    self.output = Some(output);
+                    info!("a display appeared - the output is up");
+                    self.queue_redraw();
+                }
+                Ok(None) => {}
+                Err(err) => warn!(
+                    ?err,
+                    "a connector appeared but the output would not come up"
+                ),
+            }
+            return;
+        }
         let Some(mode) = self.tty.on_connector_change() else {
             return;
         };

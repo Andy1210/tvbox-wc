@@ -26,16 +26,37 @@ fn shell_app_id() -> String {
     std::env::var("TVBOX_SHELL_APP_ID").unwrap_or_else(|_| SHELL_APP_ID.to_owned())
 }
 
-/// A window's xdg app id, as it was last committed.
+/// A window's app id, latched the first time it is asked for.
+///
+/// `xdg_toplevel.set_app_id` can be sent at any time, and two decisions here key off
+/// the answer: which windows stay in front, and where a placed window goes. Reading
+/// it live would let a client walk in front of the shell by renaming itself to
+/// `tvbox-shell` after mapping, or escape a picture-in-picture rectangle by renaming
+/// itself out of it. The first answer is the one that counts.
+///
+/// This is not a security boundary - a client that maps with the shell's app id from
+/// the start still joins that group, and on this box every Wayland client is
+/// something the shell or the user installed. It removes the mid-flight change,
+/// which is the part that is neither useful nor expected.
 pub fn app_id(window: &Window) -> Option<String> {
     let surface = window.wl_surface()?;
     with_states(&surface, |states| {
-        states
+        let latched = states.data_map.get_or_insert(LatchedAppId::default);
+        if let Some(id) = latched.0.borrow().as_ref() {
+            return id.clone();
+        }
+        let committed = states
             .data_map
             .get::<XdgToplevelSurfaceData>()
-            .and_then(|data| data.lock().ok().and_then(|data| data.app_id.clone()))
+            .and_then(|data| data.lock().ok().and_then(|data| data.app_id.clone()));
+        *latched.0.borrow_mut() = Some(committed.clone());
+        committed
     })
 }
+
+/// The app id a window first presented, kept per surface.
+#[derive(Default)]
+struct LatchedAppId(std::cell::RefCell<Option<Option<String>>>);
 
 /// Back to front: everything else first, the shell's windows last.
 pub fn stacked(space: &Space<Window>) -> Vec<Window> {

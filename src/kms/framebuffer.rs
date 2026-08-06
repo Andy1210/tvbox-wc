@@ -224,7 +224,13 @@ pub fn framebuffer_from_dmabuf(
         match drm.prime_fd_to_buffer(fd) {
             Ok(handle) => {
                 handles[index] = Some(handle);
-                imported.push(handle);
+                // A multi-plane video buffer hands over the same dma_buf once per
+                // plane, and the kernel answers with the SAME GEM handle without
+                // taking a second reference. Closing it twice fails on the second
+                // go, once per imported frame, at warn level - which is every film.
+                if !imported.contains(&handle) {
+                    imported.push(handle);
+                }
             }
             Err(source) => {
                 close_all(drm, &imported);

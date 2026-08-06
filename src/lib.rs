@@ -36,6 +36,7 @@ use smithay::input::keyboard::XkbConfig;
 use smithay::input::pointer::CursorImageStatus;
 use smithay::input::SeatState;
 use smithay::reexports::calloop::generic::Generic;
+use smithay::reexports::calloop::signals::{Signal, Signals};
 use smithay::reexports::calloop::{EventLoop, Interest, Mode, PostAction};
 use smithay::reexports::wayland_server::{Display, DisplayHandle};
 use smithay::wayland::compositor::CompositorState;
@@ -104,10 +105,15 @@ pub fn run(options: cli::Options) -> Result<()> {
         placements: Default::default(),
     };
 
-    let output = state.tty.init_output()?;
-    output.create_global::<Tvbox>(&display_handle);
-    state.space.map_output(&output, (0, 0));
-    state.output = Some(output);
+    // A box plugged in while the TV is off has no connector yet, and that is a wait
+    // rather than a failure - the udev source below brings the output up when one
+    // appears. Everything past this point works with no output; nothing renders
+    // until there is one.
+    if let Some(output) = state.tty.init_output()? {
+        output.create_global::<Tvbox>(&display_handle);
+        state.space.map_output(&output, (0, 0));
+        state.output = Some(output);
+    }
 
     let _output_manager = OutputManagerState::new_with_xdg_output::<Tvbox>(&display_handle);
     // mpv's dmabuf output refuses to start without it.
@@ -260,9 +266,27 @@ pub fn run(options: cli::Options) -> Result<()> {
         None => None,
     };
 
+    // SIGTERM and SIGINT end the loop the same way the quit combination does, so
+    // the session's Drop runs. Without this, systemd stopping the session leaves
+    // the shell and mpv behind.
+    {
+        let running = state.running.clone();
+        event_loop
+            .handle()
+            .insert_source(
+                Signals::new(&[Signal::SIGTERM, Signal::SIGINT])
+                    .context("failed to watch for signals")?,
+                move |event, _, _state| {
+                    info!(signal = ?event.signal(), "asked to stop");
+                    running.store(false, Ordering::SeqCst);
+                },
+            )
+            .map_err(|err| anyhow::anyhow!("failed to insert the signal source: {err}"))?;
+    }
+
     let running = state.running.clone();
     let signal = event_loop.get_signal();
-    event_loop
+    let result = event_loop
         .run(Some(Duration::from_millis(16)), &mut state, |state| {
             if !running.load(Ordering::SeqCst) {
                 signal.stop();
@@ -274,14 +298,13 @@ pub fn run(options: cli::Options) -> Result<()> {
             state::refresh_primary_scanout_output(state);
             let _ = state.display_handle.flush_clients();
         })
-        .context("the event loop failed")?;
+        .context("the event loop failed");
 
-    // greetd ends the session by killing the process group, but a compositor that
-    // stopped on its own (the quit combination) would otherwise leave the shell
-    // running against a display that is gone.
-    if let Some(session) = session {
-        session.stop();
-    }
+    // Not conditional on the loop's result: `session` is dropped here either way,
+    // and its Drop stops the session. An error path that skipped this would leave
+    // the shell running against a display that is gone.
+    drop(session);
+    result?;
 
     Ok(())
 }

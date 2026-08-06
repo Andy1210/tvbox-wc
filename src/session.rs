@@ -21,6 +21,10 @@ use crate::state::Tvbox;
 pub struct Session {
     /// Also the process group id: the child leads its own group.
     pid: i32,
+    /// Set once the child has been reaped. After that the pid belongs to the
+    /// kernel again and may already name someone else's process group, so the
+    /// signal below must not go out.
+    reaped: Arc<AtomicBool>,
 }
 
 impl Session {
@@ -30,8 +34,25 @@ impl Session {
     /// its children - signalling only the script would leave the shell running on a
     /// display that is about to disappear.
     pub fn stop(&self) {
+        if self.reaped.load(Ordering::SeqCst) {
+            return;
+        }
         // Safety: kill(2) with a negative pid signals the process group.
         unsafe { libc::kill(-self.pid, libc::SIGTERM) };
+    }
+}
+
+/// The session must not outlive the compositor, whatever ends it.
+///
+/// It is deliberately in its own process group - so a signal aimed at the
+/// compositor does not travel to it - which also means the group kill greetd sends
+/// at the end of a session does not reach it either. Without this, an error path or
+/// a panic leaves the shell, mpv and the audio running against a Wayland socket
+/// that no longer exists, and the next compositor comes up with a second session on
+/// top of the first.
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -59,6 +80,8 @@ pub fn spawn(
     // the session's first act is to connect to it. The channel is how the answer
     // gets back into the loop; a bare atomic would not wake it up.
     let (sender, receiver) = channel::channel::<i32>();
+    let reaped = Arc::new(AtomicBool::new(false));
+    let watcher_reaped = reaped.clone();
     std::thread::Builder::new()
         .name("session-wait".to_owned())
         .spawn(move || {
@@ -66,6 +89,7 @@ pub fn spawn(
                 Ok(status) => status.code().unwrap_or(-1),
                 Err(_) => -1,
             };
+            watcher_reaped.store(true, Ordering::SeqCst);
             let _ = sender.send(code);
         })
         .context("failed to start the session watcher")?;
@@ -79,5 +103,5 @@ pub fn spawn(
         })
         .map_err(|err| anyhow::anyhow!("failed to watch the session: {err}"))?;
 
-    Ok(Session { pid })
+    Ok(Session { pid, reaped })
 }

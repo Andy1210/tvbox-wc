@@ -168,7 +168,12 @@ impl HdrProperties {
         // A deeper link is what the mode may not have the bandwidth for - 4K60 RGB
         // at 10 bits is past HDMI 2.0. Losing the colour space over that would be
         // the wrong trade: the sink can still read PQ at 8 bits, banding and all.
-        if result.is_err() && self.max_bpc.is_some() && on {
+        //
+        // The retry is not limited to the claim. A RELEASE the driver refuses leaves
+        // the set in BT.2020 + PQ with an SDR launcher on it - washed out until
+        // something else claims and releases successfully - so it is worth trying
+        // without the bit depth there too.
+        if result.is_err() && self.max_bpc.is_some() {
             let mut retry = AtomicModeReq::new();
             retry.add_raw_property(connector.into(), self.colorspace, colorspace);
             retry.add_raw_property(connector.into(), self.metadata, new_blob);

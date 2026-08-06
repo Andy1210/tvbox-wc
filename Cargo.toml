@@ -1,6 +1,6 @@
 [package]
 name = "tvbox-wc"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 rust-version = "1.85"
 description = "Wayland compositor for the tvbox: the display engine composes, not the GPU"
@@ -11,6 +11,11 @@ categories = ["gui"]
 
 [dependencies]
 anyhow = "1.0"
+# Same calloop smithay re-exports (features are additive, so this just turns on the
+# signal source there too). SIGTERM has to end the loop rather than the process:
+# the session runs in its own process group and only the compositor's own shutdown
+# path stops it.
+calloop = { version = "0.14", features = ["signals"] }
 libc = "0.2"
 png = "0.18"
 serde = { version = "1.0", features = ["derive"] }

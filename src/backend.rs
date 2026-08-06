@@ -129,19 +129,34 @@ impl Tty {
     }
 
     /// Bring up the first connected connector at its preferred mode.
-    pub fn init_output(&mut self) -> Result<Output> {
+    ///
+    /// `Ok(None)` means there is nothing plugged in yet. That is not a failure: a
+    /// box is routinely powered on with the TV off, and exiting would leave greetd
+    /// restarting a session that cannot start until someone reaches for a remote.
+    /// The udev source calls this again on every connector change.
+    ///
+    /// The connectors are FORCE-probed here, the same way the hotplug path does it.
+    /// Without that this depends on the kernel's initial probe having already seen a
+    /// set that may still have been asleep when the driver looked.
+    pub fn init_output(&mut self) -> Result<Option<Output>> {
         let device = self
             .device
             .as_mut()
             .ok_or_else(|| anyhow!("no device opened"))?;
+        if device.surface.is_some() {
+            return Ok(None); // already up; a hotplug is on_connector_change's business
+        }
 
         let resources = device.drm.resource_handles().context("resource_handles")?;
         let connector = resources
             .connectors()
             .iter()
-            .filter_map(|handle| device.drm.get_connector(*handle, false).ok())
-            .find(|connector| connector.state() == connector::State::Connected)
-            .ok_or_else(|| anyhow!("no connected connector"))?;
+            .filter_map(|handle| device.drm.get_connector(*handle, true).ok())
+            .find(|connector| connector.state() == connector::State::Connected);
+        let Some(connector) = connector else {
+            info!("nothing connected yet - waiting for a display");
+            return Ok(None);
+        };
 
         // The largest mode a TV advertises can be one the hardware cannot drive
         // (DCI-4K, 4096 wide). The preferred mode is the one it means.
@@ -230,7 +245,7 @@ impl Tty {
             redraw_queued: false,
         });
 
-        Ok(output)
+        Ok(Some(output))
     }
 
     /// A mode's refresh in mHz, computed from its timings.
@@ -352,6 +367,14 @@ impl Tty {
             .get_connector(surface.connector, false)
             .context("failed to read the connector")?;
 
+        // A DRM mode size is a u16, so a request that does not fit one cannot match
+        // anything - and casting it would silently wrap: 67456 becomes 1920, so a
+        // caller's arithmetic bug would change the mode and be told it worked.
+        let size = match (u16::try_from(w), u16::try_from(h)) {
+            (Ok(w), Ok(h)) if w > 0 && h > 0 => (w, h),
+            _ => anyhow::bail!("{w}x{h} is not a mode size"),
+        };
+
         let output_name = format!("{:?}-{}", connector.interface(), connector.interface_id());
         if output_name != name {
             return Err(anyhow!("no output named {name}"));
@@ -360,7 +383,7 @@ impl Tty {
         let mode = connector
             .modes()
             .iter()
-            .filter(|mode| mode.size() == (w as u16, h as u16))
+            .filter(|mode| mode.size() == (size.0, size.1))
             .find(|mode| match refresh {
                 // Within a millihertz: the shell round-trips what we reported.
                 Some(wanted) => (Self::refresh_mhz(mode) - wanted).abs() <= 1,
@@ -492,6 +515,12 @@ impl Tty {
         }
         info!("the display came back");
         surface.asleep = false;
+        // Whatever happens below, drawing has to be possible again: every early
+        // return here used to leave frame_pending set from the frame that was in
+        // flight when the TV went away, and then nothing ever drew - the set comes
+        // back on to a black screen.
+        surface.frame_pending = false;
+        surface.redraw_needed = true;
 
         // Re-apply what the shell asked for if the display still offers it. Falling
         // back to the preferred mode is what makes a TV that was switched off during
@@ -513,10 +542,14 @@ impl Tty {
             return None;
         }
         if let Err(err) = surface.compositor.reset_state() {
-            warn!(?err, "failed to reset the compositor state");
+            // The next commit will be built on state the driver no longer agrees
+            // with, so say it at a level that reaches the log rather than carrying
+            // on quietly.
+            warn!(
+                ?err,
+                "failed to reset the compositor state - the next frame may be refused"
+            );
         }
-        surface.frame_pending = false;
-        surface.redraw_needed = true;
 
         info!(
             mode = format!(
@@ -636,6 +669,11 @@ impl smithay::reexports::drm::Device for DumbDevice {}
 impl smithay::reexports::drm::control::Device for DumbDevice {}
 
 /// Render the output, if anything changed and no frame is in flight.
+/// How long to wait before trying a frame again after one failed. Long enough not
+/// to spin on a device that is busy, short enough that the picture comes back on
+/// its own rather than waiting for a client to commit something.
+const RETRY_AFTER: std::time::Duration = std::time::Duration::from_millis(50);
+
 pub fn render(state: &mut crate::state::Tvbox) {
     if !state.tty.is_active() {
         return;
@@ -672,6 +710,12 @@ pub fn render(state: &mut crate::state::Tvbox) {
 
     trace!(elements = elements.len(), "rendering");
 
+    // Set by the failure paths below: the damage is consumed by then, so the frame
+    // is gone and only another attempt brings the picture back. Nothing else would
+    // ask for one - a vblank never arrives for a frame that was never queued, and a
+    // static launcher screen commits nothing.
+    let mut retry = false;
+
     // ALLOW_PRIMARY_PLANE_SCANOUT_ANY is the load-bearing flag, and it is not in
     // DEFAULT: without it an element may only take the primary plane when its format
     // matches the composition swapchain's. The swapchain is XRGB and a decoded frame
@@ -700,7 +744,7 @@ pub fn render(state: &mut crate::state::Tvbox) {
                 surface.redraw_needed = false;
             } else if let Err(err) = surface.compositor.queue_frame(()) {
                 warn!(?err, "failed to queue a frame");
-                surface.redraw_needed = false;
+                retry = true;
             } else {
                 surface.frame_pending = true;
                 surface.redraw_needed = false;
@@ -708,11 +752,19 @@ pub fn render(state: &mut crate::state::Tvbox) {
         }
         Err(err) => {
             warn!(?err, "failed to render a frame");
-            surface.redraw_needed = false;
+            retry = true;
         }
     }
 
     crate::render::send_frames(&state.space, &output);
+
+    if retry {
+        let timer = smithay::reexports::calloop::timer::Timer::from_duration(RETRY_AFTER);
+        let _ = state.loop_handle.insert_source(timer, |_, _, state| {
+            state.queue_redraw();
+            smithay::reexports::calloop::timer::TimeoutAction::Drop
+        });
+    }
 }
 
 /// A page flip completed.
