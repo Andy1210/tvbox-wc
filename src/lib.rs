@@ -46,6 +46,7 @@ use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::presentation::PresentationState;
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::shell::wlr_layer::WlrLayerShellState;
+use smithay::wayland::shell::xdg::decoration::XdgDecorationState;
 use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shm::ShmState;
 use smithay::wayland::input_method::InputMethodManagerState;
@@ -93,6 +94,10 @@ pub fn run(options: cli::Options) -> Result<()> {
         seat_state,
         data_device_state: DataDeviceState::new::<Tvbox>(&display_handle),
         xdg_shell_state: XdgShellState::new::<Tvbox>(&display_handle),
+        // Advertised so a client does not conclude it has to decorate itself: the
+        // toolkits that do reach for libdecor, and RetroArch hangs in it here
+        // before it ever creates a window.
+        xdg_decoration_state: XdgDecorationState::new::<Tvbox>(&display_handle),
         layer_shell_state: WlrLayerShellState::new::<Tvbox>(&display_handle),
         dmabuf_state: DmabufState::new(),
         dmabuf_global: None,

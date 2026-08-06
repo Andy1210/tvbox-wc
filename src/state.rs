@@ -35,6 +35,8 @@ use smithay::wayland::selection::SelectionHandler;
 use smithay::wayland::shell::wlr_layer::{
     Layer, LayerSurface as WlrLayerSurface, WlrLayerShellHandler, WlrLayerShellState,
 };
+use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
+use smithay::wayland::shell::xdg::decoration::{XdgDecorationHandler, XdgDecorationState};
 use smithay::wayland::shell::xdg::{
     PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
 };
@@ -42,7 +44,7 @@ use smithay::wayland::shm::{ShmHandler, ShmState};
 use smithay::wayland::text_input::TextInputSeat;
 use smithay::{
     delegate_compositor, delegate_data_device, delegate_dmabuf, delegate_layer_shell,
-    delegate_output, delegate_seat, delegate_shm, delegate_xdg_shell,
+    delegate_output, delegate_seat, delegate_shm, delegate_xdg_decoration, delegate_xdg_shell,
 };
 use tracing::{debug, info, warn};
 
@@ -97,6 +99,10 @@ pub struct Tvbox {
     pub seat_state: SeatState<Tvbox>,
     pub data_device_state: DataDeviceState,
     pub xdg_shell_state: XdgShellState,
+    /// Held for its global. Nothing reads it: the handler above answers every
+    /// request with the same mode, since this compositor draws no decorations.
+    #[allow(dead_code)]
+    pub xdg_decoration_state: XdgDecorationState,
     pub layer_shell_state: WlrLayerShellState,
     pub dmabuf_state: DmabufState,
     /// The dmabuf global, once the renderer's formats are known.
@@ -514,6 +520,16 @@ impl Tvbox {
         self.space.map_element(window.clone(), geometry.loc, true);
     }
 
+    /// Tell a toplevel the compositor owns its decorations, whatever it asked for.
+    fn decorate(&mut self, toplevel: &ToplevelSurface) {
+        toplevel.with_pending_state(|state| {
+            state.decoration_mode = Some(DecorationMode::ServerSide);
+        });
+        if toplevel.is_initial_configure_sent() {
+            toplevel.send_pending_configure();
+        }
+    }
+
     /// Send the first configure a surface is waiting for.
     fn ensure_initial_configure(&mut self, surface: &WlSurface) {
         if let Some(window) = self.window_for_surface(surface) {
@@ -600,6 +616,27 @@ impl DataDeviceHandler for Tvbox {
 // A TV box has nothing to drag and nowhere to drop it; the default refuses the
 // grab.
 impl WaylandDndGrabHandler for Tvbox {}
+
+/// Decorations are the compositor's, and there are none.
+///
+/// Advertising this at all is what matters: a client that finds no decoration
+/// manager assumes it has to draw its own, and the toolkits that do that reach for
+/// libdecor - which RetroArch hangs in on this box, before it ever creates a
+/// window. Everything here is fullscreen and has no title bar, so the answer is
+/// always the same one.
+impl XdgDecorationHandler for Tvbox {
+    fn new_decoration(&mut self, toplevel: ToplevelSurface) {
+        self.decorate(&toplevel);
+    }
+
+    fn request_mode(&mut self, toplevel: ToplevelSurface, _mode: DecorationMode) {
+        self.decorate(&toplevel);
+    }
+
+    fn unset_mode(&mut self, toplevel: ToplevelSurface) {
+        self.decorate(&toplevel);
+    }
+}
 
 impl XdgShellHandler for Tvbox {
     fn xdg_shell_state(&mut self) -> &mut XdgShellState {
@@ -767,6 +804,7 @@ delegate_seat!(Tvbox);
 delegate_data_device!(Tvbox);
 delegate_output!(Tvbox);
 delegate_xdg_shell!(Tvbox);
+delegate_xdg_decoration!(Tvbox);
 delegate_layer_shell!(Tvbox);
 delegate_dmabuf!(Tvbox);
 
