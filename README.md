@@ -49,13 +49,19 @@ built for and what was measured first.
 | `src/kms/framebuffer.rs` | direct dmabuf -> KMS framebuffer export, bypassing gbm for client buffers |
 | `src/kms/hdr.rs` | the output's colour space and its HDR metadata blob |
 | `src/stacking.rs` | the shell's window stays in front of everything else |
+| `src/session.rs` | the session the compositor starts, and stops with |
 | `src/ipc.rs` + `docs/ipc.md` | the control socket the shell drives all of this from |
 | `src/typing.rs` | typing a string no ordinary keymap can produce |
 | `tools/` | the probe harness the measurements were taken with |
 | `docs/measurements.md` | what the hardware actually does, and what it refuses |
 
-Not there yet: XWayland (the shell's picture-in-picture player needs a home), and
-HDR is implemented but unverified against a set that accepts PQ.
+No XWayland, and none needed: the one thing that wanted it - placing the player's
+picture-in-picture window - is `place_window` on the control socket.
+
+HDR is verified on the hardware at the DRM level (BT.2020 + PQ metadata + a 10-bit
+link, on and off cleanly, with a 4K HDR film on the primary plane and the
+compositor at 0 ms of GPU per 10 s). What a measurement cannot answer is whether
+the set lit its HDR badge; that needs eyes on the TV.
 
 ## Decisions worth knowing
 
