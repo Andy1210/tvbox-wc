@@ -40,20 +40,19 @@ use smithay::reexports::calloop::signals::{Signal, Signals};
 use smithay::reexports::calloop::{EventLoop, Interest, Mode, PostAction};
 use smithay::reexports::wayland_server::{Display, DisplayHandle};
 use smithay::wayland::compositor::CompositorState;
-use smithay::reexports::wayland_protocols::wp::linux_dmabuf::zv1::server::zwp_linux_dmabuf_feedback_v1::TrancheFlags;
 use smithay::wayland::dmabuf::{DmabufFeedbackBuilder, DmabufState};
+use smithay::wayland::idle_inhibit::IdleInhibitManagerState;
+use smithay::wayland::input_method::InputMethodManagerState;
 use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::presentation::PresentationState;
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::shell::wlr_layer::WlrLayerShellState;
-use smithay::wayland::idle_inhibit::IdleInhibitManagerState;
 use smithay::wayland::shell::xdg::decoration::XdgDecorationState;
 use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shm::ShmState;
-use smithay::wayland::input_method::InputMethodManagerState;
 use smithay::wayland::single_pixel_buffer::SinglePixelBufferState;
-use smithay::wayland::text_input::TextInputManagerState;
 use smithay::wayland::socket::ListeningSocketSource;
+use smithay::wayland::text_input::TextInputManagerState;
 use smithay::wayland::viewporter::ViewporterState;
 use tracing::{info, warn};
 
@@ -155,26 +154,8 @@ pub fn run(options: cli::Options) -> Result<()> {
                 .count(),
             "advertising dmabuf formats"
         );
-        let scanout = state.tty.scanout_formats();
-        info!(
-            scanout_formats = scanout.len(),
-            p030 = scanout
-                .iter()
-                .filter(|format| format.code == smithay::backend::allocator::Fourcc::P030)
-                .count(),
-            "advertising a scan-out tranche"
-        );
+        let builder = DmabufFeedbackBuilder::new(node.dev_id(), formats);
 
-        // The tranche's target device is the RENDER node, the same one the main
-        // tranche names: a target device is where the client must be able to
-        // ALLOCATE, and it cannot allocate on the card node. The Scanout flag is what
-        // says these formats reach a plane; naming the card node instead just makes
-        // clients ignore the tranche, which is indistinguishable from not sending it.
-        let mut builder = DmabufFeedbackBuilder::new(node.dev_id(), formats);
-        if !scanout.is_empty() {
-            builder =
-                builder.add_preference_tranche(node.dev_id(), Some(TrancheFlags::Scanout), scanout);
-        }
         match builder.build() {
             Ok(feedback) => {
                 let global = state

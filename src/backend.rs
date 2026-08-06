@@ -414,18 +414,11 @@ impl Tty {
     /// The formats the display engine can scan out, from the planes this output
     /// actually uses.
     ///
-    /// Advertised to clients as a scan-out tranche: without it a client allocates
-    /// whatever its renderer likes (BROADCOM_UIF here), no plane can take that
-    /// buffer, and the compositor is back to compositing everything - including the
-    /// film that was happily on the primary plane a moment earlier.
-    ///
-    /// Deliberately NOT intersected with what the renderer can import. The Pi's
-    /// 10-bit decoder output (P030 + BROADCOM_SAND128) is a format the planes take
-    /// and the GLES renderer does not, so intersecting drops exactly the format a
-    /// 4K HDR film arrives in - the client then never offers it and the whole
-    /// 10-bit path is closed. A tranche is a preference, not a promise: the main
-    /// tranche still carries the renderer's formats for a client that cannot use
-    /// this one.
+    /// NOT advertised to clients any more - see the comment where the dmabuf
+    /// feedback is built for what a scan-out tranche did to Vulkan. Kept because it
+    /// answers "what can this display actually take", which is the first question
+    /// when a buffer is being composited instead of scanned out.
+    #[allow(dead_code)]
     pub fn scanout_formats(&self) -> Vec<smithay::backend::allocator::Format> {
         let Some(device) = self.device.as_ref() else {
             return Vec::new();
@@ -468,6 +461,15 @@ impl Tty {
             return Some(node);
         }
         render_node_on_the_system().or(card)
+    }
+
+    /// The device the picture is actually scanned out on.
+    ///
+    /// Not the same as [`Self::render_node`] here: vc4 drives the display and has no
+    /// render node, v3d renders and has no connectors.
+    #[allow(dead_code)]
+    pub fn scanout_node(&self) -> Option<DrmNode> {
+        DrmNode::from_file(self.device.as_ref()?.gbm.as_fd()).ok()
     }
 
     /// Check that a client's dmabuf is at least renderable.
