@@ -39,16 +39,23 @@ hypotheses that turned out wrong on the way.
 
 ## Status
 
-Early. What exists is the piece that was proven on hardware first:
+Runs the box. `tvbox-gaming` boots on it: greetd starts `tvbox-wc -- tvbox-session`,
+the shell comes up as a client, and mode setting, focus, typing, screenshots and
+remote input all go through it. The film-on-a-plane arrangement is what it was
+built for and what was measured first.
 
 | | |
 | --- | --- |
 | `src/kms/framebuffer.rs` | direct dmabuf -> KMS framebuffer export, bypassing gbm for client buffers |
+| `src/kms/hdr.rs` | the output's colour space and its HDR metadata blob |
+| `src/stacking.rs` | the shell's window stays in front of everything else |
+| `src/ipc.rs` + `docs/ipc.md` | the control socket the shell drives all of this from |
+| `src/typing.rs` | typing a string no ordinary keymap can produce |
 | `tools/` | the probe harness the measurements were taken with |
 | `docs/measurements.md` | what the hardware actually does, and what it refuses |
 
-Not written yet: the compositor itself - session, seat, output and mode handling,
-xdg-shell and layer-shell, the plane policy, the shell IPC, HDR arbitration.
+Not there yet: XWayland (the shell's picture-in-picture player needs a home), and
+HDR is implemented but unverified against a set that accepts PQ.
 
 ## Decisions worth knowing
 
