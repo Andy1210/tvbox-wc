@@ -59,6 +59,12 @@ use tracing::{info, warn};
 use crate::backend::Tty;
 use crate::state::{ClientState, Tvbox};
 
+/// How long a button must be held before it starts repeating, in milliseconds.
+const REPEAT_DELAY_MS: i32 = 450;
+
+/// How many repeats a second once it does.
+const REPEAT_RATE_HZ: i32 = 9;
+
 /// Run the compositor until it is asked to stop.
 pub fn run(options: cli::Options) -> Result<()> {
     let mut event_loop: EventLoop<Tvbox> = EventLoop::try_new().context("EventLoop::try_new")?;
@@ -77,7 +83,15 @@ pub fn run(options: cli::Options) -> Result<()> {
     // nor pointer.
     let mut seat_state = SeatState::<Tvbox>::new();
     let mut seat = seat_state.new_wl_seat(&display_handle, seat_name.clone());
-    seat.add_keyboard(XkbConfig::default(), 200, 25)
+    // Key repeat is a remote's repeat, not a keyboard's. The client does the
+    // repeating from these numbers, and a desktop's (200 ms, 25 a second) turns an
+    // ordinary press of a TV remote button - 300 ms or so, the button is stiff and
+    // the hand is on a sofa - into five events: five characters typed, or five rows
+    // scrolled past the one that was wanted. Worse, the repeat runs in a client that
+    // may be busy, so the extra keys arrive after the button is back up and it reads
+    // as a flaky remote rather than as a setting. Holding a direction still scrolls,
+    // at a rate someone can follow.
+    seat.add_keyboard(XkbConfig::default(), REPEAT_DELAY_MS, REPEAT_RATE_HZ)
         .context("failed to add a keyboard")?;
     seat.add_pointer();
 
