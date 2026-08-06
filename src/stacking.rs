@@ -128,14 +128,20 @@ mod tests {
         // asked in between. Remembering that silence unnames the window forever.
         let mut remembered = None;
         assert_eq!(latch(&mut remembered, None), None);
-        assert_eq!(latch(&mut remembered, Some("tvbox-shell".into())), Some("tvbox-shell".into()));
+        assert_eq!(
+            latch(&mut remembered, Some("tvbox-shell".into())),
+            Some("tvbox-shell".into())
+        );
     }
 
     #[test]
     fn the_first_name_is_the_one_that_counts() {
         let mut remembered = None;
         latch(&mut remembered, Some("mpv".into()));
-        assert_eq!(latch(&mut remembered, Some("tvbox-shell".into())), Some("mpv".into()));
+        assert_eq!(
+            latch(&mut remembered, Some("tvbox-shell".into())),
+            Some("mpv".into())
+        );
     }
 
     #[test]
