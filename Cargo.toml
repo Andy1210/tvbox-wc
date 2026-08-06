@@ -1,6 +1,6 @@
 [package]
 name = "tvbox-wc"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2021"
 rust-version = "1.85"
 description = "Wayland compositor for the tvbox: the display engine composes, not the GPU"
