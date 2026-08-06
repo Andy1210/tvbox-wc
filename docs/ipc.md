@@ -146,9 +146,13 @@ video on a plane and the compositor doing no GPU work, "everything is fine" read
 the same as a frozen screen in every counter, twice measured. Two shots a few
 seconds apart, compared, is the cheapest honest check that a client is drawing.
 
-What it captures is the scene, not the planes as the display engine composes them.
-That is also what a capture protocol would hand a client. Whether the right thing
-is on the right plane is a question for the plane state, not for this.
+What it captures is the scene as the RENDERER can compose it, not the planes as the
+display engine does. In practice that means a hardware-decoded film is missing from
+the picture: its P030 buffer never becomes a texture, so a shot taken during
+playback shows the UI over an empty background while the TV shows the film. That is
+also what a capture protocol would hand a client. Whether the right thing is on the
+right plane is a question for the plane state (`/sys/kernel/debug/dri/1/state`), not
+for this.
 
 ### Errors
 
