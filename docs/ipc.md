@@ -80,6 +80,28 @@ because the launcher handles it itself. The shell does this today with
 `sendInputEvent` in three separate places; here it happens once, for every client,
 including the ones that are not Electron.
 
+### `place_window`
+
+```json
+{"id": 8, "request": "place_window", "app_id": "mpv", "x": 1418, "y": 32, "w": 499, "h": 281}
+{"id": 8, "ok": null}
+```
+
+Where a client's windows go, in output pixels. Leave the rectangle out entirely to
+put them back on the whole output:
+
+```json
+{"id": 9, "request": "place_window", "app_id": "mpv"}
+```
+
+This is how picture-in-picture works. A Wayland client cannot place itself, which is
+why the shell used to run the player under XWayland for it; the compositor can, so
+the player is an ordinary Wayland client either way.
+
+Set it BEFORE the client starts. A window is placed as it maps, so a player launched
+into a rectangle never appears fullscreen for a frame first. A placed window is not
+given the keyboard - the shell's UI keeps it, which is the point of a small player.
+
 ### `type_text`
 
 ```json
