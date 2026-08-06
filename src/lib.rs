@@ -101,6 +101,7 @@ pub fn run(options: cli::Options) -> Result<()> {
         pointer_visible: true,
         pointer_moved_at: std::time::Instant::now(),
         focus: Default::default(),
+        placements: Default::default(),
     };
 
     let output = state.tty.init_output()?;

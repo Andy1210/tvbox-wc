@@ -53,6 +53,21 @@ pub enum Request {
     },
     /// What the compositor is currently told and doing.
     GetState,
+    /// Where a client's windows go: a rectangle, or the whole output.
+    PlaceWindow {
+        /// The client's Wayland app id (`mpv` for the player).
+        app_id: String,
+        /// Left edge, in output pixels. All four are needed for a rectangle;
+        /// leaving them out puts the client back on the whole output.
+        #[serde(default)]
+        x: Option<i32>,
+        #[serde(default)]
+        y: Option<i32>,
+        #[serde(default)]
+        w: Option<i32>,
+        #[serde(default)]
+        h: Option<i32>,
+    },
     /// Type a string into the focused field.
     TypeText {
         /// What to type.
@@ -303,6 +318,17 @@ fn dispatch(state: &mut Tvbox, request: Request) -> Result<serde_json::Value> {
             Ok(serde_json::Value::Null)
         }
         Request::GetState => Ok(serde_json::json!({ "focus": state.focus })),
+        Request::PlaceWindow { app_id, x, y, w, h } => {
+            let rect = match (x, y, w, h) {
+                (Some(x), Some(y), Some(w), Some(h)) if w > 0 && h > 0 => {
+                    Some(smithay::utils::Rectangle::new((x, y).into(), (w, h).into()))
+                }
+                (None, None, None, None) => None,
+                _ => anyhow::bail!("a rectangle needs x, y, w and h, and a positive size"),
+            };
+            state.set_placement(app_id, rect);
+            Ok(serde_json::Value::Null)
+        }
         Request::TypeText { text, select_all } => {
             let keys = state.type_text(&text, select_all)?;
             Ok(serde_json::json!({ "keys": keys }))

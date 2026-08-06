@@ -11,6 +11,9 @@ env:
 
 jobs:
   build:
+    # Only what the release upload needs; the default token is read-only.
+    permissions:
+      contents: write
     # An arm64 runner rather than a cross toolchain: this only ever runs on a
     # Raspberry Pi 5, and a native build is also what the tests run on.
     runs-on: ubuntu-24.04-arm

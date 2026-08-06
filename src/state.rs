@@ -19,7 +19,7 @@ use smithay::reexports::calloop::LoopHandle;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::protocol::{wl_seat, wl_surface::WlSurface};
 use smithay::reexports::wayland_server::{Client, DisplayHandle};
-use smithay::utils::{Logical, Point, Serial};
+use smithay::utils::{Logical, Point, Rectangle, Serial};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
     get_parent, is_sync_subsurface, with_states, CompositorClientState, CompositorHandler,
@@ -119,6 +119,9 @@ pub struct Tvbox {
     pub pointer_moved_at: std::time::Instant,
     /// What the shell says is on screen.
     pub focus: Focus,
+    /// Where a client's windows go, by app id. A window with no entry takes the
+    /// whole output, which is what a TV box does with almost everything.
+    pub placements: std::collections::HashMap<String, Rectangle<i32, Logical>>,
 }
 
 impl Tvbox {
@@ -185,6 +188,28 @@ impl Tvbox {
             .elements()
             .find(|window| window.wl_surface().map(|s| *s == *surface).unwrap_or(false))
             .cloned()
+    }
+
+    /// Where a client's windows go from now on. `rect` of `None` puts them back on
+    /// the whole output.
+    ///
+    /// Set BEFORE the client starts: a window is placed as it maps, so a player
+    /// launched into a rectangle never appears fullscreen first.
+    pub fn set_placement(&mut self, app_id: String, rect: Option<Rectangle<i32, Logical>>) {
+        match rect {
+            Some(rect) => self.placements.insert(app_id.clone(), rect),
+            None => self.placements.remove(&app_id),
+        };
+        let windows: Vec<Window> = self
+            .space
+            .elements()
+            .filter(|window| crate::stacking::app_id(window).as_deref() == Some(app_id.as_str()))
+            .cloned()
+            .collect();
+        for window in windows {
+            self.place(&window);
+        }
+        self.queue_redraw();
     }
 
     /// Drive the output at a different mode, and put everything back on it.
@@ -397,7 +422,7 @@ impl CompositorHandler for Tvbox {
             // client pick its first size.
             let mapped = window.geometry().size.w > 0 && window.geometry().size.h > 0;
             if mapped {
-                self.fullscreen(&window);
+                self.place(&window);
             }
         }
 
@@ -408,6 +433,41 @@ impl CompositorHandler for Tvbox {
 }
 
 impl Tvbox {
+    /// Put a window where it belongs: the whole output, or the rectangle the shell
+    /// asked for.
+    ///
+    /// The rectangle is how picture-in-picture works. A Wayland client cannot place
+    /// itself, which is why the shell used to run the player under XWayland for
+    /// this; the compositor can, so it does.
+    pub fn place(&mut self, window: &Window) {
+        let wanted = crate::stacking::app_id(window)
+            .and_then(|app_id| self.placements.get(&app_id).copied());
+        match wanted {
+            Some(rect) => self.place_at(window, rect),
+            None => self.fullscreen(window),
+        }
+    }
+
+    /// Put a window in a rectangle, and do not give it the keyboard: the shell's UI
+    /// stays in front and keeps the remote, which is the whole point of a small
+    /// player - you browse while it plays.
+    fn place_at(&mut self, window: &Window, rect: Rectangle<i32, Logical>) {
+        if let Some(toplevel) = window.toplevel() {
+            let changed = toplevel.with_pending_state(|state| {
+                let wanted = Some(rect.size);
+                let already =
+                    state.size == wanted && !state.states.contains(xdg_toplevel::State::Fullscreen);
+                state.size = wanted;
+                state.states.unset(xdg_toplevel::State::Fullscreen);
+                !already
+            });
+            if changed && toplevel.is_initial_configure_sent() {
+                toplevel.send_pending_configure();
+            }
+        }
+        self.space.map_element(window.clone(), rect.loc, false);
+    }
+
     /// Put a window on the output at its full size.
     fn fullscreen(&mut self, window: &Window) {
         let Some(output) = self.output.clone() else {
