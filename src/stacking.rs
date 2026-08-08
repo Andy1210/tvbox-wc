@@ -34,13 +34,23 @@ const SHELL_APP_ID: &str = "tvbox-shell";
 const OVERLAY_TITLE: &str = "tvbox-overlay";
 
 /// The app id to treat as the shell, for a box that renames it.
-fn shell_app_id() -> String {
-    std::env::var("TVBOX_SHELL_APP_ID").unwrap_or_else(|_| SHELL_APP_ID.to_owned())
+///
+/// Resolved once. This is asked for every window of every frame, and reading the
+/// environment there would allocate a string per window per frame - and let a
+/// mid-run `set_var` disagree with the stacking that is already on screen.
+fn shell_app_id() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        std::env::var("TVBOX_SHELL_APP_ID").unwrap_or_else(|_| SHELL_APP_ID.to_owned())
+    })
 }
 
-/// The title that marks the always-on-top overlay.
-fn overlay_title() -> String {
-    std::env::var("TVBOX_OVERLAY_TITLE").unwrap_or_else(|_| OVERLAY_TITLE.to_owned())
+/// The title that marks the always-on-top overlay. Resolved once, as above.
+fn overlay_title() -> &'static str {
+    static TITLE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TITLE.get_or_init(|| {
+        std::env::var("TVBOX_OVERLAY_TITLE").unwrap_or_else(|_| OVERLAY_TITLE.to_owned())
+    })
 }
 
 /// Where a window sits, back to front.
@@ -149,8 +159,8 @@ fn rank(window: &Window) -> Rank {
     rank_of(
         app_id(window).as_deref(),
         title(window).as_deref(),
-        &shell_app_id(),
-        &overlay_title(),
+        shell_app_id(),
+        overlay_title(),
     )
 }
 
