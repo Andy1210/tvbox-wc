@@ -55,10 +55,18 @@ pub enum Request {
     },
     /// What the compositor is currently told and doing.
     GetState,
-    /// Where a client's windows go: a rectangle, or the whole output.
+    /// Where windows go: a rectangle, or the whole output.
+    ///
+    /// Named by `app_id` (every window of that client) or by `title` (the one
+    /// window carrying it). A title is what places a single window of a client with
+    /// several - the shell's, whose windows all share one app id.
     PlaceWindow {
         /// The client's Wayland app id (`mpv` for the player).
-        app_id: String,
+        #[serde(default)]
+        app_id: Option<String>,
+        /// One window's title, when an app id would be too broad.
+        #[serde(default)]
+        title: Option<String>,
         /// Left edge, in output pixels. All four are needed for a rectangle;
         /// leaving them out puts the client back on the whole output.
         #[serde(default)]
@@ -370,7 +378,21 @@ fn dispatch(state: &mut Tvbox, request: Request) -> Result<serde_json::Value> {
                 "windows": windows,
             }))
         }
-        Request::PlaceWindow { app_id, x, y, w, h } => {
+        Request::PlaceWindow {
+            app_id,
+            title,
+            x,
+            y,
+            w,
+            h,
+        } => {
+            let key = match (app_id, title) {
+                (Some(app_id), None) => crate::state::PlaceKey::AppId(app_id),
+                (None, Some(title)) => crate::state::PlaceKey::Title(title),
+                _ => anyhow::bail!(
+                    "name the windows by app_id or by title, not both and not neither"
+                ),
+            };
             let rect = match (x, y, w, h) {
                 (Some(x), Some(y), Some(w), Some(h)) if w > 0 && h > 0 => {
                     Some(smithay::utils::Rectangle::new((x, y).into(), (w, h).into()))
@@ -378,7 +400,7 @@ fn dispatch(state: &mut Tvbox, request: Request) -> Result<serde_json::Value> {
                 (None, None, None, None) => None,
                 _ => anyhow::bail!("a rectangle needs x, y, w and h, and a positive size"),
             };
-            state.set_placement(app_id, rect);
+            state.set_placement(key, rect);
             Ok(serde_json::Value::Null)
         }
         Request::TypeText { text, select_all } => {

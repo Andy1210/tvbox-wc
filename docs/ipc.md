@@ -82,6 +82,20 @@ that decides what is drawn over what, which makes this the question to ask when 
 key ends up somewhere unexpected: a film that answers the remote is a film that is
 in front of the UI, whatever the screen looks like.
 
+One window is the exception to "in front means the keyboard": a **shell** window
+whose TITLE is `tvbox-overlay` (or whatever `TVBOX_OVERLAY_TITLE` says) is drawn in
+front of everything, the rest of the shell included, and is never given key events.
+It is how a note appears over a running app without that app losing the remote.
+
+The title rather than an app id, because every window of one Chromium process
+presents the same app id - the launcher, an app and a note are all `tvbox-shell`,
+and only the title varies per window. The app id still has to match the shell's, so
+a page cannot put itself in front by renaming its document.
+
+It is an ordinary window otherwise, so it is a scan-out candidate like the rest: a
+SMALL one can take a hardware plane rather than costing a composited pass over the
+film, which is why this is a little window and not the shell's fullscreen one.
+
 `owner` is `launcher` or `app`. The compositor cannot work this out for itself: the
 launcher and an app can be windows of the same process, and "an app is on screen"
 is the shell's own state machine rather than a property of any surface.
@@ -110,6 +124,18 @@ put them back on the whole output:
 This is how picture-in-picture works. A Wayland client cannot place itself, which is
 why the shell used to run the player under XWayland for it; the compositor can, so
 the player is an ordinary Wayland client either way.
+
+Name the windows by `app_id` **or** by `title`, not both:
+
+```json
+{"id": 10, "request": "place_window", "title": "tvbox-overlay", "x": 0, "y": 900, "w": 1920, "h": 180}
+```
+
+An app id covers every window of a client, which is right for the player and wrong
+for a client that has several. Every window of one Chromium process shares an app
+id, so a title is the only way to place ONE of the shell's - the small note above,
+for instance, which has to be small for the same reason it is separate: a fullscreen
+translucent surface over a film is a composited pass, and a little one is a plane.
 
 Set it BEFORE the client starts. A window is placed as it maps, so a player launched
 into a rectangle never appears fullscreen for a frame first. A placed window is not

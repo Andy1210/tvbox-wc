@@ -21,9 +21,47 @@ use smithay::wayland::shell::xdg::XdgToplevelSurfaceData;
 /// The shell's Wayland app id, which is its package name.
 const SHELL_APP_ID: &str = "tvbox-shell";
 
+/// The TITLE of the one shell window that sits above even the rest of the shell.
+///
+/// A note on screen has to be visible over whatever is running - that is the whole
+/// point of it - and the shell's own window is not, because an app's window covers
+/// it while the app is in front. So one window is exempt from the rule below.
+///
+/// A title and not an app id, and that is forced: every window of one Chromium
+/// process presents the same app id, so the launcher, an app and a note are all
+/// `tvbox-shell` and nothing tells them apart from the outside. The title is what a
+/// client can vary per window.
+const OVERLAY_TITLE: &str = "tvbox-overlay";
+
 /// The app id to treat as the shell, for a box that renames it.
-fn shell_app_id() -> String {
-    std::env::var("TVBOX_SHELL_APP_ID").unwrap_or_else(|_| SHELL_APP_ID.to_owned())
+///
+/// Resolved once. This is asked for every window of every frame, and reading the
+/// environment there would allocate a string per window per frame - and let a
+/// mid-run `set_var` disagree with the stacking that is already on screen.
+fn shell_app_id() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| {
+        std::env::var("TVBOX_SHELL_APP_ID").unwrap_or_else(|_| SHELL_APP_ID.to_owned())
+    })
+}
+
+/// The title that marks the always-on-top overlay. Resolved once, as above.
+fn overlay_title() -> &'static str {
+    static TITLE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    TITLE.get_or_init(|| {
+        std::env::var("TVBOX_OVERLAY_TITLE").unwrap_or_else(|_| OVERLAY_TITLE.to_owned())
+    })
+}
+
+/// Where a window sits, back to front.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Rank {
+    /// Everything else: an app, a film, a native program.
+    Other,
+    /// The shell's own windows.
+    Shell,
+    /// The note that has to be seen over all of it.
+    Overlay,
 }
 
 /// A window's app id, latched the first time the client presents one.
@@ -71,32 +109,97 @@ fn latch(remembered: &mut Option<String>, committed: Option<String>) -> Option<S
 #[derive(Default)]
 struct LatchedAppId(std::cell::RefCell<Option<String>>);
 
-/// Back to front: everything else first, the shell's windows last.
+/// A window's current title.
+///
+/// Not latched, unlike the app id: the title is how the ONE overlay window is
+/// recognised, and it has to be, because every window of one Chromium process
+/// carries the same app id - the shell's launcher, an app and a note are all
+/// `tvbox-shell`. The title is the only thing the client can vary per window.
+///
+/// That is also why the overlay is only granted to a window that is already the
+/// SHELL's: a title is a page-settable string, and without that condition any web
+/// app could name itself into the front of the screen.
+fn title(window: &Window) -> Option<String> {
+    let surface = window.wl_surface()?;
+    with_states(&surface, |states| {
+        states
+            .data_map
+            .get::<XdgToplevelSurfaceData>()
+            .and_then(|data| data.lock().ok().and_then(|data| data.title.clone()))
+    })
+}
+
+/// The keys a window can be placed by, most specific first.
+///
+/// A title names one window and an app id names all of a client's, so a title
+/// placement has to win - otherwise placing the shell's small note would put the
+/// launcher in the same little rectangle.
+pub fn place_key(window: &Window) -> Vec<crate::state::PlaceKey> {
+    use crate::state::PlaceKey;
+    let mut keys = Vec::new();
+    if let Some(title) = title(window) {
+        keys.push(PlaceKey::Title(title));
+    }
+    if let Some(app_id) = app_id(window) {
+        keys.push(PlaceKey::AppId(app_id));
+    }
+    keys
+}
+
+/// Back to front: everything else, then the shell's windows, then the overlay.
 pub fn stacked(space: &Space<Window>) -> Vec<Window> {
-    let shell = shell_app_id();
-    let marked: Vec<(Window, bool)> = space
-        .elements()
-        .cloned()
-        .map(|window| {
-            let is_shell = app_id(&window).as_deref() == Some(shell.as_str());
-            (window, is_shell)
-        })
-        .collect();
-    order(marked)
+    order(space.elements().cloned().map(|window| {
+        let rank = rank(&window);
+        (window, rank)
+    }))
+}
+
+/// Which group a window belongs to.
+fn rank(window: &Window) -> Rank {
+    rank_of(
+        app_id(window).as_deref(),
+        title(window).as_deref(),
+        shell_app_id(),
+        overlay_title(),
+    )
+}
+
+/// The rule itself, away from Wayland: who is allowed in front of what.
+fn rank_of(app_id: Option<&str>, title: Option<&str>, shell: &str, overlay: &str) -> Rank {
+    if app_id != Some(shell) {
+        // Only the shell's own windows can be an overlay. A title is a string any
+        // page can set, so without this a web app could name itself to the front.
+        return Rank::Other;
+    }
+    if title == Some(overlay) {
+        Rank::Overlay
+    } else {
+        Rank::Shell
+    }
 }
 
 /// Back to front, keeping the given order within each group.
-fn order<T>(windows: Vec<(T, bool)>) -> Vec<T> {
-    let (shell, rest): (Vec<_>, Vec<_>) = windows.into_iter().partition(|(_, is_shell)| *is_shell);
-    rest.into_iter()
-        .chain(shell)
-        .map(|(window, _)| window)
-        .collect()
+fn order<T>(windows: impl IntoIterator<Item = (T, Rank)>) -> Vec<T> {
+    let mut windows: Vec<(usize, T, Rank)> = windows
+        .into_iter()
+        .enumerate()
+        .map(|(i, (window, rank))| (i, window, rank))
+        .collect();
+    // Stable by rank: a sort that lost map order within a group would reshuffle the
+    // windows every frame for no reason anyone asked for.
+    windows.sort_by_key(|(i, _, rank)| (*rank, *i));
+    windows.into_iter().map(|(_, window, _)| window).collect()
 }
 
-/// The window that should hold the keyboard: the frontmost one.
+/// The window that should hold the keyboard.
+///
+/// The frontmost one, EXCEPT the overlay: it is a note, not a place to type. Giving
+/// it the keyboard because it happens to be in front would take the remote away
+/// from whatever the person is actually using, for as long as the note is up.
 pub fn topmost(space: &Space<Window>) -> Option<Window> {
-    stacked(space).pop()
+    stacked(space)
+        .into_iter()
+        .rfind(|window| rank(window) != Rank::Overlay)
 }
 
 #[cfg(test)]
@@ -107,19 +210,78 @@ mod tests {
     fn the_shell_ends_up_in_front_of_a_film_that_mapped_later() {
         // The order the box actually produces: the shell starts at boot, mpv maps
         // when a film starts.
-        let order = order(vec![("shell", true), ("mpv", false)]);
+        let order = order(vec![("shell", Rank::Shell), ("mpv", Rank::Other)]);
         assert_eq!(order, vec!["mpv", "shell"]);
     }
 
     #[test]
     fn map_order_survives_within_a_group() {
         let order = order(vec![
-            ("shell", true),
-            ("mpv", false),
-            ("popup", true),
-            ("retroarch", false),
+            ("shell", Rank::Shell),
+            ("mpv", Rank::Other),
+            ("popup", Rank::Shell),
+            ("retroarch", Rank::Other),
         ]);
         assert_eq!(order, vec!["mpv", "retroarch", "shell", "popup"]);
+    }
+
+    #[test]
+    fn a_note_is_in_front_of_an_app_that_is_covering_the_shell() {
+        // The case it exists for: an app is fullscreen, so the shell's own window is
+        // behind it, and the note still has to be seen.
+        let order = order(vec![
+            ("shell", Rank::Shell),
+            ("plex", Rank::Other),
+            ("note", Rank::Overlay),
+        ]);
+        assert_eq!(order, vec!["plex", "shell", "note"]);
+    }
+
+    #[test]
+    fn only_the_shell_may_claim_the_front() {
+        // A title is a string any page can set, and every Chromium window shares one
+        // app id - so the app id is what has to gate this, not the title alone.
+        assert_eq!(
+            rank_of(
+                Some("tvbox-shell"),
+                Some("tvbox-overlay"),
+                "tvbox-shell",
+                "tvbox-overlay"
+            ),
+            Rank::Overlay
+        );
+        assert_eq!(
+            rank_of(
+                Some("mpv"),
+                Some("tvbox-overlay"),
+                "tvbox-shell",
+                "tvbox-overlay"
+            ),
+            Rank::Other
+        );
+        assert_eq!(
+            rank_of(
+                Some("tvbox-shell"),
+                Some("Plex"),
+                "tvbox-shell",
+                "tvbox-overlay"
+            ),
+            Rank::Shell
+        );
+        assert_eq!(
+            rank_of(None, None, "tvbox-shell", "tvbox-overlay"),
+            Rank::Other
+        );
+    }
+
+    #[test]
+    fn two_notes_keep_their_order() {
+        let order = order(vec![
+            ("first", Rank::Overlay),
+            ("app", Rank::Other),
+            ("second", Rank::Overlay),
+        ]);
+        assert_eq!(order, vec!["app", "first", "second"]);
     }
 
     #[test]
@@ -147,7 +309,7 @@ mod tests {
     #[test]
     fn a_screen_with_no_shell_window_is_left_alone() {
         // What a native program sees: the shell unmapped everything of its own.
-        let order = order(vec![("retroarch", false)]);
+        let order = order(vec![("retroarch", Rank::Other)]);
         assert_eq!(order, vec!["retroarch"]);
     }
 }
