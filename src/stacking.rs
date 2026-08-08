@@ -129,6 +129,36 @@ pub fn window_title(window: &Window) -> Option<String> {
     })
 }
 
+/// Has this window changed groups since the last time it was asked?
+///
+/// Kept per surface, so the commit that RENAMES a window can be told from the
+/// thousands that change nothing. That rename is how the overlay becomes the
+/// overlay: Chromium sends a title after the toplevel has already mapped, and the
+/// keyboard was handed out at map time, when the window was still nameless and
+/// therefore ordinary. Measured before this existed: the note sat in front of the
+/// app and held the remote.
+///
+/// The first answer is never a change - the window has only just appeared, and its
+/// keyboard was decided as it mapped.
+pub fn note_rank_change(window: &Window) -> bool {
+    let now = rank(window);
+    let Some(surface) = window.wl_surface() else {
+        return false;
+    };
+    with_states(&surface, |states| {
+        let seen = states.data_map.get_or_insert(LastRank::default);
+        let mut last = seen.0.borrow_mut();
+        let asked_before = seen.1.replace(true);
+        let changed = *last != Some(now);
+        *last = Some(now);
+        changed && asked_before
+    })
+}
+
+/// The group a window was in when it was last asked, and whether it was ever asked.
+#[derive(Default)]
+struct LastRank(std::cell::RefCell<Option<Rank>>, std::cell::Cell<bool>);
+
 /// The keys a window can be placed by, most specific first.
 ///
 /// A title names one window and an app id names all of a client's, so a title
