@@ -134,9 +134,23 @@ pub struct Tvbox {
     pub pointer_moved_at: std::time::Instant,
     /// What the shell says is on screen.
     pub focus: Focus,
-    /// Where a client's windows go, by app id. A window with no entry takes the
-    /// whole output, which is what a TV box does with almost everything.
-    pub placements: std::collections::HashMap<String, Rectangle<i32, Logical>>,
+    /// Where windows go. A window with no entry takes the whole output, which is
+    /// what a TV box does with almost everything.
+    pub placements: std::collections::HashMap<PlaceKey, Rectangle<i32, Logical>>,
+}
+
+/// What a placement is keyed by.
+///
+/// By app id for a client whose every window belongs somewhere - the player, whose
+/// picture-in-picture rectangle is the reason placement exists. By title for ONE
+/// window of a client that has several: every window of a Chromium process shares
+/// one app id, so the shell's small note could not be placed any other way.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum PlaceKey {
+    /// Every window of this client.
+    AppId(String),
+    /// The one window carrying this title.
+    Title(String),
 }
 
 impl Tvbox {
@@ -210,15 +224,15 @@ impl Tvbox {
     ///
     /// Set BEFORE the client starts: a window is placed as it maps, so a player
     /// launched into a rectangle never appears fullscreen first.
-    pub fn set_placement(&mut self, app_id: String, rect: Option<Rectangle<i32, Logical>>) {
+    pub fn set_placement(&mut self, key: PlaceKey, rect: Option<Rectangle<i32, Logical>>) {
         match rect {
-            Some(rect) => self.placements.insert(app_id.clone(), rect),
-            None => self.placements.remove(&app_id),
+            Some(rect) => self.placements.insert(key.clone(), rect),
+            None => self.placements.remove(&key),
         };
         let windows: Vec<Window> = self
             .space
             .elements()
-            .filter(|window| crate::stacking::app_id(window).as_deref() == Some(app_id.as_str()))
+            .filter(|window| crate::stacking::place_key(window).contains(&key))
             .cloned()
             .collect();
         for window in windows {
@@ -482,8 +496,11 @@ impl Tvbox {
     /// itself, which is why the shell used to run the player under XWayland for
     /// this; the compositor can, so it does.
     pub fn place(&mut self, window: &Window) {
-        let wanted = crate::stacking::app_id(window)
-            .and_then(|app_id| self.placements.get(&app_id).copied());
+        // Title first: it names ONE window, and an app-id placement would otherwise
+        // drag every window of that client into the same rectangle.
+        let wanted = crate::stacking::place_key(window)
+            .into_iter()
+            .find_map(|key| self.placements.get(&key).copied());
         match wanted {
             Some(rect) => self.place_at(window, rect),
             None => self.fullscreen(window),

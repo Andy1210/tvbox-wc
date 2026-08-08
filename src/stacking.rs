@@ -119,6 +119,23 @@ fn title(window: &Window) -> Option<String> {
     })
 }
 
+/// The keys a window can be placed by, most specific first.
+///
+/// A title names one window and an app id names all of a client's, so a title
+/// placement has to win - otherwise placing the shell's small note would put the
+/// launcher in the same little rectangle.
+pub fn place_key(window: &Window) -> Vec<crate::state::PlaceKey> {
+    use crate::state::PlaceKey;
+    let mut keys = Vec::new();
+    if let Some(title) = title(window) {
+        keys.push(PlaceKey::Title(title));
+    }
+    if let Some(app_id) = app_id(window) {
+        keys.push(PlaceKey::AppId(app_id));
+    }
+    keys
+}
+
 /// Back to front: everything else, then the shell's windows, then the overlay.
 pub fn stacked(space: &Space<Window>) -> Vec<Window> {
     order(space.elements().cloned().map(|window| {

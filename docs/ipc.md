@@ -125,6 +125,18 @@ This is how picture-in-picture works. A Wayland client cannot place itself, whic
 why the shell used to run the player under XWayland for it; the compositor can, so
 the player is an ordinary Wayland client either way.
 
+Name the windows by `app_id` **or** by `title`, not both:
+
+```json
+{"id": 10, "request": "place_window", "title": "tvbox-overlay", "x": 0, "y": 900, "w": 1920, "h": 180}
+```
+
+An app id covers every window of a client, which is right for the player and wrong
+for a client that has several. Every window of one Chromium process shares an app
+id, so a title is the only way to place ONE of the shell's - the small note above,
+for instance, which has to be small for the same reason it is separate: a fullscreen
+translucent surface over a film is a composited pass, and a little one is a plane.
+
 Set it BEFORE the client starts. A window is placed as it maps, so a player launched
 into a rectangle never appears fullscreen for a frame first. A placed window is not
 given the keyboard - the shell's UI keeps it, which is the point of a small player.
