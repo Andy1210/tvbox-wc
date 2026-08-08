@@ -366,6 +366,11 @@ fn dispatch(state: &mut Tvbox, request: Request) -> Result<serde_json::Value> {
                     let surface = window.wl_surface().map(|s| s.into_owned());
                     serde_json::json!({
                         "app_id": crate::stacking::app_id(window),
+                        // The title as well, because it is what marks the overlay -
+                        // and a window whose title never arrived looks exactly like
+                        // one that was never meant to be in front. Without it here,
+                        // that is a guess.
+                        "title": crate::stacking::window_title(window),
                         "keyboard": surface.is_some() && surface == focused,
                     })
                 })

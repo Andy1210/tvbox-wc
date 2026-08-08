@@ -70,8 +70,8 @@ reads.
   "focus": {"app": "plex"},
   "idle_inhibited": true,
   "windows": [
-    {"app_id": "mpv", "keyboard": false},
-    {"app_id": "tvbox-shell", "keyboard": true}
+    {"app_id": "mpv", "title": "a film", "keyboard": false},
+    {"app_id": "tvbox-shell", "title": "tvbox", "keyboard": true}
   ]
 }}
 ```
