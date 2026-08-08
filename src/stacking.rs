@@ -119,7 +119,7 @@ struct LatchedAppId(std::cell::RefCell<Option<String>>);
 /// That is also why the overlay is only granted to a window that is already the
 /// SHELL's: a title is a page-settable string, and without that condition any web
 /// app could name itself into the front of the screen.
-fn title(window: &Window) -> Option<String> {
+pub fn window_title(window: &Window) -> Option<String> {
     let surface = window.wl_surface()?;
     with_states(&surface, |states| {
         states
@@ -137,7 +137,7 @@ fn title(window: &Window) -> Option<String> {
 pub fn place_key(window: &Window) -> Vec<crate::state::PlaceKey> {
     use crate::state::PlaceKey;
     let mut keys = Vec::new();
-    if let Some(title) = title(window) {
+    if let Some(title) = window_title(window) {
         keys.push(PlaceKey::Title(title));
     }
     if let Some(app_id) = app_id(window) {
@@ -158,7 +158,7 @@ pub fn stacked(space: &Space<Window>) -> Vec<Window> {
 fn rank(window: &Window) -> Rank {
     rank_of(
         app_id(window).as_deref(),
-        title(window).as_deref(),
+        window_title(window).as_deref(),
         shell_app_id(),
         overlay_title(),
     )
