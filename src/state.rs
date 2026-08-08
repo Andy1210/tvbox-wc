@@ -480,6 +480,15 @@ impl CompositorHandler for Tvbox {
             if mapped {
                 self.place(&window);
             }
+            // A window's title decides whether it is the overlay, and a client may
+            // send it AFTER the toplevel maps - Chromium does. The keyboard was
+            // handed out at map time, when the window was still nameless and
+            // therefore an ordinary one, and nothing looked again: measured, the
+            // note ended up in front of the app AND holding the remote. So when a
+            // window's group changes, ask the question again.
+            if crate::stacking::note_rank_change(&window) {
+                self.refresh_keyboard_focus();
+            }
         }
 
         self.popups.commit(surface);

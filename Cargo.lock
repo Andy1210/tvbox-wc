@@ -1025,7 +1025,7 @@ dependencies = [
 
 [[package]]
 name = "tvbox-wc"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "calloop",
