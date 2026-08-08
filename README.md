@@ -48,7 +48,7 @@ built for and what was measured first.
 | --- | --- |
 | `src/kms/framebuffer.rs` | direct dmabuf -> KMS framebuffer export, bypassing gbm for client buffers |
 | `src/kms/hdr.rs` | the output's colour space and its HDR metadata blob |
-| `src/stacking.rs` | the shell's window stays in front of everything else, and a small `tvbox-overlay` window in front of even that - without ever taking the keyboard |
+| `src/stacking.rs` | the shell's window stays in front of everything else, and its small `tvbox-overlay`-titled window in front of even that - without ever taking the keyboard |
 | `src/session.rs` | the session the compositor starts, and stops with |
 | `src/ipc.rs` + `docs/ipc.md` | the control socket the shell drives all of this from |
 | `src/typing.rs` | typing a string no ordinary keymap can produce |

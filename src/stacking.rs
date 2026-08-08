@@ -21,25 +21,26 @@ use smithay::wayland::shell::xdg::XdgToplevelSurfaceData;
 /// The shell's Wayland app id, which is its package name.
 const SHELL_APP_ID: &str = "tvbox-shell";
 
-/// The app id of the one window that sits above even the shell.
+/// The TITLE of the one shell window that sits above even the rest of the shell.
 ///
 /// A note on screen has to be visible over whatever is running - that is the whole
 /// point of it - and the shell's own window is not, because an app's window covers
 /// it while the app is in front. So one window is exempt from the rule below.
 ///
-/// Deliberately a SEPARATE id rather than another shell window: the exemption is
-/// what lets something cover an app, so the narrower the thing holding it, the
-/// better. It is also small and never focused - see [`topmost`].
-const OVERLAY_APP_ID: &str = "tvbox-overlay";
+/// A title and not an app id, and that is forced: every window of one Chromium
+/// process presents the same app id, so the launcher, an app and a note are all
+/// `tvbox-shell` and nothing tells them apart from the outside. The title is what a
+/// client can vary per window.
+const OVERLAY_TITLE: &str = "tvbox-overlay";
 
 /// The app id to treat as the shell, for a box that renames it.
 fn shell_app_id() -> String {
     std::env::var("TVBOX_SHELL_APP_ID").unwrap_or_else(|_| SHELL_APP_ID.to_owned())
 }
 
-/// The app id to treat as the always-on-top overlay.
-fn overlay_app_id() -> String {
-    std::env::var("TVBOX_OVERLAY_APP_ID").unwrap_or_else(|_| OVERLAY_APP_ID.to_owned())
+/// The title that marks the always-on-top overlay.
+fn overlay_title() -> String {
+    std::env::var("TVBOX_OVERLAY_TITLE").unwrap_or_else(|_| OVERLAY_TITLE.to_owned())
 }
 
 /// Where a window sits, back to front.
@@ -98,6 +99,26 @@ fn latch(remembered: &mut Option<String>, committed: Option<String>) -> Option<S
 #[derive(Default)]
 struct LatchedAppId(std::cell::RefCell<Option<String>>);
 
+/// A window's current title.
+///
+/// Not latched, unlike the app id: the title is how the ONE overlay window is
+/// recognised, and it has to be, because every window of one Chromium process
+/// carries the same app id - the shell's launcher, an app and a note are all
+/// `tvbox-shell`. The title is the only thing the client can vary per window.
+///
+/// That is also why the overlay is only granted to a window that is already the
+/// SHELL's: a title is a page-settable string, and without that condition any web
+/// app could name itself into the front of the screen.
+fn title(window: &Window) -> Option<String> {
+    let surface = window.wl_surface()?;
+    with_states(&surface, |states| {
+        states
+            .data_map
+            .get::<XdgToplevelSurfaceData>()
+            .and_then(|data| data.lock().ok().and_then(|data| data.title.clone()))
+    })
+}
+
 /// Back to front: everything else, then the shell's windows, then the overlay.
 pub fn stacked(space: &Space<Window>) -> Vec<Window> {
     order(space.elements().cloned().map(|window| {
@@ -108,10 +129,25 @@ pub fn stacked(space: &Space<Window>) -> Vec<Window> {
 
 /// Which group a window belongs to.
 fn rank(window: &Window) -> Rank {
-    match app_id(window).as_deref() {
-        Some(id) if id == overlay_app_id() => Rank::Overlay,
-        Some(id) if id == shell_app_id() => Rank::Shell,
-        _ => Rank::Other,
+    rank_of(
+        app_id(window).as_deref(),
+        title(window).as_deref(),
+        &shell_app_id(),
+        &overlay_title(),
+    )
+}
+
+/// The rule itself, away from Wayland: who is allowed in front of what.
+fn rank_of(app_id: Option<&str>, title: Option<&str>, shell: &str, overlay: &str) -> Rank {
+    if app_id != Some(shell) {
+        // Only the shell's own windows can be an overlay. A title is a string any
+        // page can set, so without this a web app could name itself to the front.
+        return Rank::Other;
+    }
+    if title == Some(overlay) {
+        Rank::Overlay
+    } else {
+        Rank::Shell
     }
 }
 
@@ -172,6 +208,43 @@ mod tests {
             ("note", Rank::Overlay),
         ]);
         assert_eq!(order, vec!["plex", "shell", "note"]);
+    }
+
+    #[test]
+    fn only_the_shell_may_claim_the_front() {
+        // A title is a string any page can set, and every Chromium window shares one
+        // app id - so the app id is what has to gate this, not the title alone.
+        assert_eq!(
+            rank_of(
+                Some("tvbox-shell"),
+                Some("tvbox-overlay"),
+                "tvbox-shell",
+                "tvbox-overlay"
+            ),
+            Rank::Overlay
+        );
+        assert_eq!(
+            rank_of(
+                Some("mpv"),
+                Some("tvbox-overlay"),
+                "tvbox-shell",
+                "tvbox-overlay"
+            ),
+            Rank::Other
+        );
+        assert_eq!(
+            rank_of(
+                Some("tvbox-shell"),
+                Some("Plex"),
+                "tvbox-shell",
+                "tvbox-overlay"
+            ),
+            Rank::Shell
+        );
+        assert_eq!(
+            rank_of(None, None, "tvbox-shell", "tvbox-overlay"),
+            Rank::Other
+        );
     }
 
     #[test]
