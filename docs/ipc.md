@@ -82,6 +82,14 @@ that decides what is drawn over what, which makes this the question to ask when 
 key ends up somewhere unexpected: a film that answers the remote is a film that is
 in front of the UI, whatever the screen looks like.
 
+One app id is the exception to "in front means the keyboard": a window called
+**`tvbox-overlay`** (or whatever `TVBOX_OVERLAY_APP_ID` says) is drawn in front of
+everything, the shell included, and is never given key events. It is how a note
+appears over a running app without that app losing the remote. It is an ordinary
+window otherwise, so it is a scan-out candidate like the rest: a SMALL one can take
+a hardware plane rather than costing a composited pass over the film, which is why
+this is a separate little window and not the shell's fullscreen one.
+
 `owner` is `launcher` or `app`. The compositor cannot work this out for itself: the
 launcher and an app can be windows of the same process, and "an app is on screen"
 is the shell's own state machine rather than a property of any surface.

@@ -21,9 +21,36 @@ use smithay::wayland::shell::xdg::XdgToplevelSurfaceData;
 /// The shell's Wayland app id, which is its package name.
 const SHELL_APP_ID: &str = "tvbox-shell";
 
+/// The app id of the one window that sits above even the shell.
+///
+/// A note on screen has to be visible over whatever is running - that is the whole
+/// point of it - and the shell's own window is not, because an app's window covers
+/// it while the app is in front. So one window is exempt from the rule below.
+///
+/// Deliberately a SEPARATE id rather than another shell window: the exemption is
+/// what lets something cover an app, so the narrower the thing holding it, the
+/// better. It is also small and never focused - see [`topmost`].
+const OVERLAY_APP_ID: &str = "tvbox-overlay";
+
 /// The app id to treat as the shell, for a box that renames it.
 fn shell_app_id() -> String {
     std::env::var("TVBOX_SHELL_APP_ID").unwrap_or_else(|_| SHELL_APP_ID.to_owned())
+}
+
+/// The app id to treat as the always-on-top overlay.
+fn overlay_app_id() -> String {
+    std::env::var("TVBOX_OVERLAY_APP_ID").unwrap_or_else(|_| OVERLAY_APP_ID.to_owned())
+}
+
+/// Where a window sits, back to front.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Rank {
+    /// Everything else: an app, a film, a native program.
+    Other,
+    /// The shell's own windows.
+    Shell,
+    /// The note that has to be seen over all of it.
+    Overlay,
 }
 
 /// A window's app id, latched the first time the client presents one.
@@ -71,32 +98,45 @@ fn latch(remembered: &mut Option<String>, committed: Option<String>) -> Option<S
 #[derive(Default)]
 struct LatchedAppId(std::cell::RefCell<Option<String>>);
 
-/// Back to front: everything else first, the shell's windows last.
+/// Back to front: everything else, then the shell's windows, then the overlay.
 pub fn stacked(space: &Space<Window>) -> Vec<Window> {
-    let shell = shell_app_id();
-    let marked: Vec<(Window, bool)> = space
-        .elements()
-        .cloned()
-        .map(|window| {
-            let is_shell = app_id(&window).as_deref() == Some(shell.as_str());
-            (window, is_shell)
-        })
-        .collect();
-    order(marked)
+    order(space.elements().cloned().map(|window| {
+        let rank = rank(&window);
+        (window, rank)
+    }))
+}
+
+/// Which group a window belongs to.
+fn rank(window: &Window) -> Rank {
+    match app_id(window).as_deref() {
+        Some(id) if id == overlay_app_id() => Rank::Overlay,
+        Some(id) if id == shell_app_id() => Rank::Shell,
+        _ => Rank::Other,
+    }
 }
 
 /// Back to front, keeping the given order within each group.
-fn order<T>(windows: Vec<(T, bool)>) -> Vec<T> {
-    let (shell, rest): (Vec<_>, Vec<_>) = windows.into_iter().partition(|(_, is_shell)| *is_shell);
-    rest.into_iter()
-        .chain(shell)
-        .map(|(window, _)| window)
-        .collect()
+fn order<T>(windows: impl IntoIterator<Item = (T, Rank)>) -> Vec<T> {
+    let mut windows: Vec<(usize, T, Rank)> = windows
+        .into_iter()
+        .enumerate()
+        .map(|(i, (window, rank))| (i, window, rank))
+        .collect();
+    // Stable by rank: a sort that lost map order within a group would reshuffle the
+    // windows every frame for no reason anyone asked for.
+    windows.sort_by_key(|(i, _, rank)| (*rank, *i));
+    windows.into_iter().map(|(_, window, _)| window).collect()
 }
 
-/// The window that should hold the keyboard: the frontmost one.
+/// The window that should hold the keyboard.
+///
+/// The frontmost one, EXCEPT the overlay: it is a note, not a place to type. Giving
+/// it the keyboard because it happens to be in front would take the remote away
+/// from whatever the person is actually using, for as long as the note is up.
 pub fn topmost(space: &Space<Window>) -> Option<Window> {
-    stacked(space).pop()
+    stacked(space)
+        .into_iter()
+        .rfind(|window| rank(window) != Rank::Overlay)
 }
 
 #[cfg(test)]
@@ -107,19 +147,41 @@ mod tests {
     fn the_shell_ends_up_in_front_of_a_film_that_mapped_later() {
         // The order the box actually produces: the shell starts at boot, mpv maps
         // when a film starts.
-        let order = order(vec![("shell", true), ("mpv", false)]);
+        let order = order(vec![("shell", Rank::Shell), ("mpv", Rank::Other)]);
         assert_eq!(order, vec!["mpv", "shell"]);
     }
 
     #[test]
     fn map_order_survives_within_a_group() {
         let order = order(vec![
-            ("shell", true),
-            ("mpv", false),
-            ("popup", true),
-            ("retroarch", false),
+            ("shell", Rank::Shell),
+            ("mpv", Rank::Other),
+            ("popup", Rank::Shell),
+            ("retroarch", Rank::Other),
         ]);
         assert_eq!(order, vec!["mpv", "retroarch", "shell", "popup"]);
+    }
+
+    #[test]
+    fn a_note_is_in_front_of_an_app_that_is_covering_the_shell() {
+        // The case it exists for: an app is fullscreen, so the shell's own window is
+        // behind it, and the note still has to be seen.
+        let order = order(vec![
+            ("shell", Rank::Shell),
+            ("plex", Rank::Other),
+            ("note", Rank::Overlay),
+        ]);
+        assert_eq!(order, vec!["plex", "shell", "note"]);
+    }
+
+    #[test]
+    fn two_notes_keep_their_order() {
+        let order = order(vec![
+            ("first", Rank::Overlay),
+            ("app", Rank::Other),
+            ("second", Rank::Overlay),
+        ]);
+        assert_eq!(order, vec!["app", "first", "second"]);
     }
 
     #[test]
@@ -147,7 +209,7 @@ mod tests {
     #[test]
     fn a_screen_with_no_shell_window_is_left_alone() {
         // What a native program sees: the shell unmapped everything of its own.
-        let order = order(vec![("retroarch", false)]);
+        let order = order(vec![("retroarch", Rank::Other)]);
         assert_eq!(order, vec!["retroarch"]);
     }
 }
