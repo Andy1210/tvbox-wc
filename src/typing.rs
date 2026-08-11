@@ -17,7 +17,7 @@
 
 use std::fmt::Write as _;
 
-use smithay::input::keyboard::{KeyboardHandle, Keycode, XkbConfig};
+use smithay::input::keyboard::{FilterResult, KeyboardHandle, Keycode, XkbConfig};
 use smithay::utils::SERIAL_COUNTER;
 use tracing::error;
 
@@ -205,13 +205,26 @@ fn send(state: &mut Tvbox, keyboard: &KeyboardHandle<Tvbox>, strokes: &[(Keycode
         } else {
             smithay::backend::input::KeyState::Released
         };
-        keyboard.input_forward(
+        // `input`, the same entry point real key events take, and NOT a bare
+        // `input_forward`: forwarding only sends the client a `modifiers` event when
+        // it is told one changed, and working that out is what the state update
+        // inside `input` does. Forwarding alone with a hardcoded `false` typed the
+        // characters perfectly - the generated keymap puts every one of them on the
+        // first level, so not one of them needs a modifier - and silently broke the
+        // only chord there is. A client takes its modifier state from that event and
+        // from nothing else, so ctrl+a arrived as a bare `a` and landed in the field
+        // as a literal character instead of selecting its contents: the replace the
+        // caller asked for became "insert an `a`, then append to what was there".
+        //
+        // The filter is where the compositor's own key bindings live. Typing must
+        // trigger none of them, so this one always forwards.
+        keyboard.input::<(), _>(
             state,
             *key,
             key_state,
             SERIAL_COUNTER.next_serial(),
             time,
-            false,
+            |_, _, _| FilterResult::Forward,
         );
     }
 }
@@ -288,6 +301,63 @@ mod tests {
         assert_eq!(
             chord.last().map(|(k, down)| (u32::from(*k), *down)),
             Some((CTRL_KEYCODE, false))
+        );
+    }
+
+    #[test]
+    fn the_chord_is_really_ctrl_and_a_under_the_seats_own_keymap() {
+        // The two keycodes are hand-computed evdev codes + 8, and the chord's whole
+        // job rests on them: an `a` that goes out with no control held is not a
+        // failed select-all, it is a literal character inserted into the field ahead
+        // of everything the user typed. Checking the stroke SHAPE cannot see that -
+        // the shape was right the whole time the bug was live - so this asks a real
+        // xkb state what the keys mean and what they leave depressed.
+        use smithay::input::keyboard::{xkb, Keysym};
+
+        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        let keymap = xkb::Keymap::new_from_names(
+            &context,
+            "",
+            "",
+            "",
+            "",
+            None,
+            xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .expect("the seat's default keymap compiles");
+        let mut xkb_state = xkb::State::new(&keymap);
+
+        assert_eq!(
+            xkb_state.key_get_one_sym(Keycode::from(A_KEYCODE)),
+            Keysym::a,
+            "the chord's second key is not the letter a"
+        );
+
+        let mut a_saw_control = false;
+        for (key, pressed) in select_all_chord() {
+            xkb_state.update_key(
+                key,
+                if pressed {
+                    xkb::KeyDirection::Down
+                } else {
+                    xkb::KeyDirection::Up
+                },
+            );
+            if u32::from(key) == A_KEYCODE && pressed {
+                a_saw_control =
+                    xkb_state.mod_name_is_active(xkb::MOD_NAME_CTRL, xkb::STATE_MODS_EFFECTIVE);
+            }
+        }
+
+        assert!(
+            a_saw_control,
+            "the a of ctrl+a goes out with no control held"
+        );
+        // And the seat is handed back the way it was found: a control left depressed
+        // would turn the string that follows into shortcuts.
+        assert!(
+            !xkb_state.mod_name_is_active(xkb::MOD_NAME_CTRL, xkb::STATE_MODS_EFFECTIVE),
+            "control is still down after the chord"
         );
     }
 
