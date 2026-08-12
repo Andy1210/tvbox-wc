@@ -17,7 +17,7 @@
 
 use std::fmt::Write as _;
 
-use smithay::input::keyboard::{KeyboardHandle, Keycode, XkbConfig};
+use smithay::input::keyboard::{FilterResult, KeyboardHandle, Keycode, XkbConfig};
 use smithay::utils::SERIAL_COUNTER;
 use tracing::error;
 
@@ -61,6 +61,8 @@ const RESERVED_EVDEV: &[u32] = &[
 /// keycodes from 8, so these are evdev 29 (left control) and 30 (a).
 const CTRL_KEYCODE: u32 = 37;
 const A_KEYCODE: u32 = 38;
+/// Delete, under that same layout: evdev 111.
+const DELETE_KEYCODE: u32 = 119;
 
 /// The keycodes a generated keymap may use.
 fn usable_keycodes() -> impl Iterator<Item = u32> {
@@ -127,6 +129,19 @@ fn select_all_chord() -> Vec<(Keycode, bool)> {
     ]
 }
 
+/// Delete, as a press and a release.
+///
+/// The chord only SELECTS. Emptying a field takes a key that removes the selection,
+/// and it is deliberately one of the codes `RESERVED_EVDEV` keeps free: a client acts
+/// on those by hardware code whatever a keymap claims, which is exactly what is
+/// wanted here and exactly why no character may sit on one.
+fn clear_stroke() -> Vec<(Keycode, bool)> {
+    vec![
+        (Keycode::from(DELETE_KEYCODE), true),
+        (Keycode::from(DELETE_KEYCODE), false),
+    ]
+}
+
 /// One press and one release per character, in order.
 fn strokes_for(keys: &[Keycode]) -> Vec<(Keycode, bool)> {
     keys.iter()
@@ -141,10 +156,15 @@ fn strokes_for(keys: &[Keycode]) -> Vec<(Keycode, bool)> {
 /// the last search, the typo being corrected) and typing would append to it. It
 /// goes out under the seat's own keymap, before the generated one is loaded, since
 /// the generated keymap has no control key at all.
+///
+/// An EMPTY string with `select_all` means "empty this field", and it is the one case
+/// where the chord is not enough on its own - selecting text deletes nothing. That
+/// request is real: the shell's keyboard now opens ON what the field already holds,
+/// so clearing it there and confirming has to reach the page, and answering it with
+/// silence would be a dead end on a screen with no other way to do it. Without
+/// `select_all` an empty string still means nothing, because then there is neither
+/// anything to type nor a selection to remove.
 pub fn type_text(state: &mut Tvbox, text: &str, select_all: bool) -> anyhow::Result<usize> {
-    if text.is_empty() {
-        return Ok(0);
-    }
     let characters = text.chars().count();
     if characters > MAX_TEXT {
         anyhow::bail!("{characters} characters is more than this will type at once");
@@ -152,6 +172,15 @@ pub fn type_text(state: &mut Tvbox, text: &str, select_all: bool) -> anyhow::Res
     let Some(keyboard) = state.seat.get_keyboard() else {
         anyhow::bail!("the seat has no keyboard");
     };
+    if text.is_empty() {
+        if select_all {
+            send(state, &keyboard, &select_all_chord());
+            send(state, &keyboard, &clear_stroke());
+        }
+        // The count is of CHARACTERS typed, which is what the chord was never in
+        // either - nothing was typed here.
+        return Ok(0);
+    }
     let (keymap, keys) = keymap_for(text)
         .ok_or_else(|| anyhow::anyhow!("the string needs too many distinct characters"))?;
 
@@ -205,13 +234,26 @@ fn send(state: &mut Tvbox, keyboard: &KeyboardHandle<Tvbox>, strokes: &[(Keycode
         } else {
             smithay::backend::input::KeyState::Released
         };
-        keyboard.input_forward(
+        // `input`, the same entry point real key events take, and NOT a bare
+        // `input_forward`: forwarding only sends the client a `modifiers` event when
+        // it is told one changed, and working that out is what the state update
+        // inside `input` does. Forwarding alone with a hardcoded `false` typed the
+        // characters perfectly - the generated keymap puts every one of them on the
+        // first level, so not one of them needs a modifier - and silently broke the
+        // only chord there is. A client takes its modifier state from that event and
+        // from nothing else, so ctrl+a arrived as a bare `a` and landed in the field
+        // as a literal character instead of selecting its contents: the replace the
+        // caller asked for became "insert an `a`, then append to what was there".
+        //
+        // The filter is where the compositor's own key bindings live. Typing must
+        // trigger none of them, so this one always forwards.
+        keyboard.input::<(), _>(
             state,
             *key,
             key_state,
             SERIAL_COUNTER.next_serial(),
             time,
-            false,
+            |_, _, _| FilterResult::Forward,
         );
     }
 }
@@ -288,6 +330,101 @@ mod tests {
         assert_eq!(
             chord.last().map(|(k, down)| (u32::from(*k), *down)),
             Some((CTRL_KEYCODE, false))
+        );
+    }
+
+    #[test]
+    fn the_chord_is_really_ctrl_and_a_under_the_seats_own_keymap() {
+        // The two keycodes are hand-computed evdev codes + 8, and the chord's whole
+        // job rests on them: an `a` that goes out with no control held is not a
+        // failed select-all, it is a literal character inserted into the field ahead
+        // of everything the user typed. Checking the stroke SHAPE cannot see that -
+        // the shape was right the whole time the bug was live - so this asks a real
+        // xkb state what the keys mean and what they leave depressed.
+        use smithay::input::keyboard::{xkb, Keysym};
+
+        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        let keymap = xkb::Keymap::new_from_names(
+            &context,
+            "",
+            "",
+            "",
+            "",
+            None,
+            xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .expect("the seat's default keymap compiles");
+        let mut xkb_state = xkb::State::new(&keymap);
+
+        assert_eq!(
+            xkb_state.key_get_one_sym(Keycode::from(A_KEYCODE)),
+            Keysym::a,
+            "the chord's second key is not the letter a"
+        );
+
+        let mut a_saw_control = false;
+        for (key, pressed) in select_all_chord() {
+            xkb_state.update_key(
+                key,
+                if pressed {
+                    xkb::KeyDirection::Down
+                } else {
+                    xkb::KeyDirection::Up
+                },
+            );
+            if u32::from(key) == A_KEYCODE && pressed {
+                a_saw_control =
+                    xkb_state.mod_name_is_active(xkb::MOD_NAME_CTRL, xkb::STATE_MODS_EFFECTIVE);
+            }
+        }
+
+        assert!(
+            a_saw_control,
+            "the a of ctrl+a goes out with no control held"
+        );
+        // And the seat is handed back the way it was found: a control left depressed
+        // would turn the string that follows into shortcuts.
+        assert!(
+            !xkb_state.mod_name_is_active(xkb::MOD_NAME_CTRL, xkb::STATE_MODS_EFFECTIVE),
+            "control is still down after the chord"
+        );
+    }
+
+    #[test]
+    fn emptying_a_field_sends_a_key_that_removes_the_selection() {
+        // Selecting is not clearing, so the chord alone would leave the field exactly
+        // as it was and the caller would never know. The key that does the work has
+        // to be one a client acts on by hardware code - which is what RESERVED_EVDEV
+        // holds - or the generated keymap could put a character on it.
+        use smithay::input::keyboard::{xkb, Keysym};
+
+        assert!(
+            RESERVED_EVDEV.contains(&(DELETE_KEYCODE - 8)),
+            "a character could be placed on the key that clears the field"
+        );
+
+        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        let keymap = xkb::Keymap::new_from_names(
+            &context,
+            "",
+            "",
+            "",
+            "",
+            None,
+            xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .expect("the seat's default keymap compiles");
+        let xkb_state = xkb::State::new(&keymap);
+        assert_eq!(
+            xkb_state.key_get_one_sym(Keycode::from(DELETE_KEYCODE)),
+            Keysym::Delete
+        );
+
+        let stroke = clear_stroke();
+        assert_eq!(stroke.len(), 2);
+        assert!(
+            stroke[0].1 && !stroke[1].1,
+            "pressed and released, in order"
         );
     }
 

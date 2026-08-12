@@ -381,6 +381,14 @@ fn dispatch(state: &mut Tvbox, request: Request) -> Result<serde_json::Value> {
                 // player. The shell's ambient screen is the thing that should honour it.
                 "idle_inhibited": state.idle_inhibited(),
                 "windows": windows,
+                // What is RUNNING, which is not what is installed: the compositor is
+                // the session, so a newly installed binary is still only a file until
+                // greetd restarts. A caller deciding whether a behaviour of ours can
+                // be relied on has to ask the process, and the shell does exactly that
+                // before it offers a field's contents to its keyboard - that offer is
+                // only safe once `type_text` replaces rather than appends. Absent on
+                // every build before this one, which is the right answer for them.
+                "version": env!("CARGO_PKG_VERSION"),
             }))
         }
         Request::PlaceWindow {

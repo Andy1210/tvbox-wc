@@ -69,12 +69,21 @@ reads.
 {"id": 5, "ok": {
   "focus": {"app": "plex"},
   "idle_inhibited": true,
+  "version": "0.1.10",
   "windows": [
     {"app_id": "mpv", "title": "a film", "keyboard": false},
     {"app_id": "tvbox-shell", "title": "tvbox", "keyboard": true}
   ]
 }}
 ```
+
+`version` is what is RUNNING, which is not the same as what is installed - the
+compositor IS the session, so a newly installed binary is only a file until greetd
+restarts. Ask for it when a behaviour of ours has to be relied on rather than hoped
+for: the shell reads it before offering a focused field's contents to its on-screen
+keyboard, because that offer is only safe once `type_text` replaces rather than
+appends. Builds before 0.1.10 do not send the field at all, which is the honest
+answer for them.
 
 `windows` is back to front, so the last entry is the one on top, and `keyboard`
 marks the surface that receives key events. Both answers come from the same rule
@@ -157,6 +166,12 @@ character in the string, generated per string.
 `select_all` sends ctrl+a first, under the seat's own keymap. A caller replacing a
 field's contents wants it: the field usually already holds something - a prefilled
 address, the last search, the typo being corrected - and typing alone appends.
+
+An EMPTY `text` with `select_all` is "empty this field", and it is the one case the
+chord cannot do alone, since selecting deletes nothing: ctrl+a is followed by Delete
+and `keys` comes back 0, because nothing was TYPED. Without `select_all` an empty
+string does nothing at all - there is neither anything to type nor a selection to
+remove.
 
 The string is typed as real key events. A keycode only produces what the keymap
 says, and no ordinary layout carries every character a password or an accented
