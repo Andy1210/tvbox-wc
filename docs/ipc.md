@@ -158,6 +158,12 @@ character in the string, generated per string.
 field's contents wants it: the field usually already holds something - a prefilled
 address, the last search, the typo being corrected - and typing alone appends.
 
+An EMPTY `text` with `select_all` is "empty this field", and it is the one case the
+chord cannot do alone, since selecting deletes nothing: ctrl+a is followed by Delete
+and `keys` comes back 0, because nothing was TYPED. Without `select_all` an empty
+string does nothing at all - there is neither anything to type nor a selection to
+remove.
+
 The string is typed as real key events. A keycode only produces what the keymap
 says, and no ordinary layout carries every character a password or an accented
 Hungarian name needs, so a keymap is generated for the string: one keycode per
