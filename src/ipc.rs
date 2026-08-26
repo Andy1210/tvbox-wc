@@ -371,6 +371,12 @@ fn dispatch(state: &mut Tvbox, request: Request) -> Result<serde_json::Value> {
                         // one that was never meant to be in front. Without it here,
                         // that is a guess.
                         "title": crate::stacking::window_title(window),
+                        // Whether the window has drawn anything yet. A toplevel
+                        // exists before its first buffer, and this list holds it
+                        // from the moment it appears while the keyboard passes it
+                        // over - so a window listed with no keyboard and no overlay
+                        // in sight is an answer, and this is what says so.
+                        "mapped": crate::stacking::mapped(window),
                         "keyboard": surface.is_some() && surface == focused,
                     })
                 })

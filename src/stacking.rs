@@ -117,8 +117,13 @@ struct LatchedAppId(std::cell::RefCell<Option<String>>);
 /// `tvbox-shell`. The title is the only thing the client can vary per window.
 ///
 /// That is also why the overlay is only granted to a window that is already the
-/// SHELL's: a title is a page-settable string, and without that condition any web
-/// app could name itself into the front of the screen.
+/// SHELL's. It is worth being exact about what that buys: it keeps out every OTHER
+/// client - mpv, a native program, anything the user installs - and it does not
+/// keep out a page running inside one of the shell's own windows, because that page
+/// is behind the shell's app id by construction. A page's document title reaches
+/// this function, so what stops one naming itself into the front is the shell
+/// refusing the reserved name on the windows it hands a page (`titleAllowed` in the
+/// shell's notify.js), not anything here.
 pub fn window_title(window: &Window) -> Option<String> {
     let surface = window.wl_surface()?;
     with_states(&surface, |states| {
@@ -129,49 +134,41 @@ pub fn window_title(window: &Window) -> Option<String> {
     })
 }
 
-/// Has this window changed groups since the last time it was asked?
-///
-/// Kept per surface, so the commit that RENAMES a window can be told from the
-/// thousands that change nothing. That rename is how the overlay becomes the
-/// overlay: Chromium sends a title after the toplevel has already mapped, and the
-/// keyboard was handed out at map time, when the window was still nameless and
-/// therefore ordinary. Measured before this existed: the note sat in front of the
-/// app and held the remote.
-///
-/// The first answer is never a change - the window has only just appeared, and its
-/// keyboard was decided as it mapped.
-pub fn note_rank_change(window: &Window) -> bool {
-    let now = rank(window);
-    let Some(surface) = window.wl_surface() else {
-        return false;
-    };
-    with_states(&surface, |states| {
-        let seen = states.data_map.get_or_insert(LastRank::default);
-        let mut last = seen.0.borrow_mut();
-        let asked_before = seen.1.replace(true);
-        let changed = *last != Some(now);
-        *last = Some(now);
-        changed && asked_before
-    })
-}
-
-/// The group a window was in when it was last asked, and whether it was ever asked.
-#[derive(Default)]
-struct LastRank(std::cell::RefCell<Option<Rank>>, std::cell::Cell<bool>);
-
 /// The keys a window can be placed by, most specific first.
 ///
 /// A title names one window and an app id names all of a client's, so a title
 /// placement has to win - otherwise placing the shell's small note would put the
 /// launcher in the same little rectangle.
+///
+/// A title only names one of the SHELL's, though, and it is gated on the app id for
+/// the same reason the rank above is: a title is a string any client can present,
+/// and the placements that exist are the shell's own. Without the gate any client
+/// could put itself in the note's rectangle by naming itself, and - because a
+/// changed location is what re-places a window - could move itself around at will
+/// by changing that name.
 pub fn place_key(window: &Window) -> Vec<crate::state::PlaceKey> {
+    place_keys_for(
+        app_id(window).as_deref(),
+        window_title(window).as_deref(),
+        shell_app_id(),
+    )
+}
+
+/// The rule itself, away from Wayland.
+fn place_keys_for(
+    app_id: Option<&str>,
+    title: Option<&str>,
+    shell: &str,
+) -> Vec<crate::state::PlaceKey> {
     use crate::state::PlaceKey;
     let mut keys = Vec::new();
-    if let Some(title) = window_title(window) {
-        keys.push(PlaceKey::Title(title));
+    if app_id == Some(shell) {
+        if let Some(title) = title {
+            keys.push(PlaceKey::Title(title.to_owned()));
+        }
     }
-    if let Some(app_id) = app_id(window) {
-        keys.push(PlaceKey::AppId(app_id));
+    if let Some(app_id) = app_id {
+        keys.push(PlaceKey::AppId(app_id.to_owned()));
     }
     keys
 }
@@ -215,10 +212,22 @@ fn order<T>(windows: impl IntoIterator<Item = (T, Rank)>) -> Vec<T> {
         .enumerate()
         .map(|(i, (window, rank))| (i, window, rank))
         .collect();
-    // Stable by rank: a sort that lost map order within a group would reshuffle the
-    // windows every frame for no reason anyone asked for.
+    // Stable by rank: a sort that lost the order the space gives within a group
+    // would reshuffle the windows every frame for no reason anyone asked for.
     windows.sort_by_key(|(i, _, rank)| (*rank, *i));
     windows.into_iter().map(|(_, window, _)| window).collect()
+}
+
+/// Is this window on screen yet?
+///
+/// A toplevel exists before its client has committed a buffer for it, and a window
+/// with nothing on screen is not what anyone is looking at. This is the same test
+/// that decides whether a window is placed, and it is shared with `commit` rather
+/// than written twice: the two must not be able to disagree about which windows
+/// have arrived.
+pub fn mapped(window: &Window) -> bool {
+    let size = window.geometry().size;
+    size.w > 0 && size.h > 0
 }
 
 /// The window that should hold the keyboard.
@@ -226,10 +235,51 @@ fn order<T>(windows: impl IntoIterator<Item = (T, Rank)>) -> Vec<T> {
 /// The frontmost one, EXCEPT the overlay: it is a note, not a place to type. Giving
 /// it the keyboard because it happens to be in front would take the remote away
 /// from whatever the person is actually using, for as long as the note is up.
+///
+/// A window that has MAPPED is preferred over one that has not, and that is what
+/// makes the exception hold for the SECOND note as well as the first. A client
+/// creates a toplevel and names it afterwards, so a new window is nameless for a
+/// moment - and the app id, unlike the title, is latched per surface, so a note
+/// reusing the surface of the last one arrives already carrying the shell's id with
+/// no title yet. It ranks as an ordinary shell window and, being the newest, would
+/// win outright. Preferring what is on screen is what leaves it behind: the window
+/// the person is looking at is mapped, and the note is not yet.
 pub fn topmost(space: &Space<Window>) -> Option<Window> {
-    stacked(space)
-        .into_iter()
-        .rfind(|window| rank(window) != Rank::Overlay)
+    focusable(space.elements().cloned().map(|window| {
+        let rank = rank(&window);
+        let mapped = mapped(&window);
+        (window, rank, mapped)
+    }))
+}
+
+/// The rule itself, away from Wayland: the frontmost window that may hold the
+/// keyboard.
+///
+/// A preference rather than a filter, because with nothing mapped to prefer the
+/// answer would be NOBODY. The shell tears the outgoing window down before the
+/// incoming one has painted, so every app switch has a gap of tens of milliseconds
+/// where the only window on the box has no buffer yet - and a keyboard focus of
+/// none there costs a press off an autorepeating arrow. The overlay stays excluded
+/// in both tiers: it is never a place to type, mapped or not.
+fn focusable<T>(windows: impl IntoIterator<Item = (T, Rank, bool)>) -> Option<T> {
+    let ordered = order(
+        windows
+            .into_iter()
+            .map(|(window, rank, mapped)| ((window, rank, mapped), rank)),
+    );
+    let mut waiting_to_map = None;
+    for (window, rank, mapped) in ordered.into_iter().rev() {
+        if rank == Rank::Overlay {
+            continue;
+        }
+        if mapped {
+            return Some(window);
+        }
+        if waiting_to_map.is_none() {
+            waiting_to_map = Some(window);
+        }
+    }
+    waiting_to_map
 }
 
 #[cfg(test)]
@@ -333,6 +383,127 @@ mod tests {
         assert_eq!(
             latch(&mut remembered, Some("tvbox-shell".into())),
             Some("mpv".into())
+        );
+    }
+
+    #[test]
+    fn a_note_never_holds_the_keyboard() {
+        // The overlay is in front of everything, and that is exactly why it must not
+        // be asked to answer the remote.
+        assert_eq!(
+            focusable(vec![
+                ("launcher", Rank::Shell, true),
+                ("note", Rank::Overlay, true),
+            ]),
+            Some("launcher")
+        );
+    }
+
+    #[test]
+    fn only_the_shell_may_be_placed_by_a_title() {
+        use crate::state::PlaceKey;
+        // A title names ONE of the shell's windows, which is what the note needs.
+        assert_eq!(
+            place_keys_for(Some("tvbox-shell"), Some("tvbox-overlay"), "tvbox-shell"),
+            vec![
+                PlaceKey::Title("tvbox-overlay".into()),
+                PlaceKey::AppId("tvbox-shell".into()),
+            ]
+        );
+        // For anyone else the title is a string they chose. Without this, naming
+        // yourself puts you in the note's rectangle - and since a changed location
+        // is what re-places a window, renaming moves you about at will.
+        assert_eq!(
+            place_keys_for(Some("mpv"), Some("tvbox-overlay"), "tvbox-shell"),
+            vec![PlaceKey::AppId("mpv".into())]
+        );
+        // A window that has not named its client is placed by nothing.
+        assert_eq!(
+            place_keys_for(None, Some("tvbox-overlay"), "tvbox-shell"),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn a_note_over_a_fullscreen_app_leaves_the_app_answering_the_remote() {
+        // What the box really produces: an app is in front, so the shell's own
+        // window has been torn down and is waiting to come back, and a note arrives
+        // over the top of it.
+        assert_eq!(
+            focusable(vec![
+                ("launcher", Rank::Shell, false),
+                ("plex", Rank::Other, true),
+                ("note", Rank::Overlay, true),
+            ]),
+            Some("plex")
+        );
+    }
+
+    #[test]
+    fn a_window_that_has_not_mapped_is_not_offered_the_keyboard() {
+        // A note showing for the second time: the surface is reused, so the app id
+        // is already the shell's while the title is still on its way. It ranks as an
+        // ordinary shell window here, and it is the newest one - without preferring
+        // what is on screen it would take the remote for as long as the note is up.
+        assert_eq!(
+            focusable(vec![
+                ("launcher", Rank::Shell, true),
+                ("nameless note", Rank::Shell, false),
+            ]),
+            Some("launcher")
+        );
+    }
+
+    #[test]
+    fn a_window_that_maps_takes_the_keyboard() {
+        // The other side of the same test: once the buffer is there, an app that
+        // opened over the launcher is what the remote should be driving.
+        assert_eq!(
+            focusable(vec![
+                ("launcher", Rank::Shell, true),
+                ("app", Rank::Shell, true),
+            ]),
+            Some("app")
+        );
+    }
+
+    #[test]
+    fn a_native_program_answers_the_remote_when_nothing_of_ours_is_left() {
+        // The shell unmaps its own windows before RetroArch starts.
+        assert_eq!(
+            focusable(vec![("retroarch", Rank::Other, true)]),
+            Some("retroarch")
+        );
+    }
+
+    #[test]
+    fn a_screen_with_only_a_note_on_it_gives_the_keyboard_to_nobody() {
+        // Rather than to the note. There is nothing else to type into, and the note
+        // is not a place to type.
+        assert_eq!(focusable(vec![("note", Rank::Overlay, true)]), None);
+    }
+
+    #[test]
+    fn the_window_on_its_way_in_answers_when_nothing_else_is_on_screen() {
+        // Every app switch: the shell tears the old window down before the new one
+        // has painted, so for a few frames the only window on the box has no buffer.
+        // Answering "nobody" there loses a press off an autorepeating arrow.
+        assert_eq!(
+            focusable(vec![("opening app", Rank::Shell, false)]),
+            Some("opening app")
+        );
+    }
+
+    #[test]
+    fn a_note_does_not_answer_even_when_it_is_the_only_thing_on_screen() {
+        // The same gap with a note up. The window still coming in gets the keyboard,
+        // and the note stays out of it in both tiers.
+        assert_eq!(
+            focusable(vec![
+                ("opening app", Rank::Shell, false),
+                ("note", Rank::Overlay, true),
+            ]),
+            Some("opening app")
         );
     }
 

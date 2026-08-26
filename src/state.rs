@@ -410,6 +410,11 @@ impl Tvbox {
 
     /// Give the keyboard to whatever should have it now: the topmost layer surface
     /// that asked for it, otherwise the frontmost window.
+    ///
+    /// Asked on every commit, so it answers with silence when the answer has not
+    /// changed. That is not only about cost: handing the focus out again takes the
+    /// text input through leave/enter, which throws away the state a client had
+    /// built on it.
     pub fn refresh_keyboard_focus(&mut self) {
         let Some(keyboard) = self.seat.get_keyboard() else {
             return;
@@ -429,10 +434,21 @@ impl Tvbox {
                 .and_then(|window| window.wl_surface().map(|s| s.into_owned()))
         });
 
+        if target == keyboard.current_focus() {
+            return;
+        }
+
         // The text input follows the keyboard, and smithay does not wire that up:
         // without `enter` a client has nothing to enable, so it ignores anything the
         // compositor commits to it. That is what an empty field looks like when
         // everything else is right.
+        //
+        // Note what the early return above leaves out: a client that binds a text
+        // input AFTER the focus last moved is never sent one, and nothing here
+        // notices the bind. It costs nothing on this box, where the shell types with
+        // synthetic keys and no client binds an input method at all - but it is the
+        // reason to reach for a hook on the bind rather than for re-sending this on
+        // every commit, if a client ever does.
         let text_input = self.seat.text_input();
         text_input.leave();
         text_input.set_focus(target.clone());
@@ -476,19 +492,16 @@ impl CompositorHandler for Tvbox {
             // and mpv dereferences a null `target_params` when that happens
             // (vo_dmabuf_wayland.c:541). The protocol says the same thing: let the
             // client pick its first size.
-            let mapped = window.geometry().size.w > 0 && window.geometry().size.h > 0;
-            if mapped {
+            if crate::stacking::mapped(&window) {
                 self.place(&window);
             }
-            // A window's title decides whether it is the overlay, and a client may
-            // send it AFTER the toplevel maps - Chromium does. The keyboard was
-            // handed out at map time, when the window was still nameless and
-            // therefore an ordinary one, and nothing looked again: measured, the
-            // note ended up in front of the app AND holding the remote. So when a
-            // window's group changes, ask the question again.
-            if crate::stacking::note_rank_change(&window) {
-                self.refresh_keyboard_focus();
-            }
+            // The buffer that puts a window on screen arrives after its toplevel
+            // does, and being on screen is what decides which window may hold the
+            // keyboard - so the answer is only settled once a client has committed
+            // something, and this is where that is noticed. The rename that turns a
+            // window into the note has a hook of its own, so it does not have to
+            // wait for a commit that may never come.
+            self.refresh_keyboard_focus();
         }
 
         self.popups.commit(surface);
@@ -533,7 +546,7 @@ impl Tvbox {
                 toplevel.send_pending_configure();
             }
         }
-        self.space.map_element(window.clone(), rect.loc, false);
+        self.map_at(window, rect.loc, false);
     }
 
     /// Put a window on the output at its full size.
@@ -560,7 +573,31 @@ impl Tvbox {
             }
         }
 
-        self.space.map_element(window.clone(), geometry.loc, true);
+        self.map_at(window, geometry.loc, true);
+    }
+
+    /// Put a window where it goes, and only when it is not already there.
+    ///
+    /// `Space::map_element` re-inserts the element at the END of the space's own
+    /// order every time it is called, and placing is reached from every commit - so
+    /// two windows that are both drawing swap places in that order at frame rate.
+    /// Nothing noticed while only the renderer read it, because they are the same
+    /// size and the same rank and the screen looks identical either way. The
+    /// keyboard reads that order too: measured with two shell windows on screen, it
+    /// changed hands 120 times a second, and the page saw every one of them as a
+    /// blur and a focus on the field somebody was typing into.
+    ///
+    /// Worth being exact about what the order becomes. A window is mapped at (0,0)
+    /// when its toplevel appears and fullscreened to the same point, so a fullscreen
+    /// window matches on the first call and is never re-inserted: the order is the
+    /// order toplevels were CREATED in, not the order they were placed. Nothing
+    /// here reads it that finely - `order` sorts by rank first, and the note is a
+    /// rank of its own - but a future rule that leans on it should know.
+    fn map_at(&mut self, window: &Window, loc: Point<i32, Logical>, activate: bool) {
+        if self.space.element_location(window) == Some(loc) {
+            return;
+        }
+        self.space.map_element(window.clone(), loc, activate);
     }
 
     /// Tell a toplevel the compositor owns its decorations, whatever it asked for.
@@ -711,6 +748,20 @@ impl XdgShellHandler for Tvbox {
         self.space.map_element(window.clone(), (0, 0), true);
         self.refresh_keyboard_focus();
         self.queue_redraw();
+    }
+
+    // A window's title is what says whether it is the note, and a client sends it
+    // when it likes - Chromium sends one after the toplevel has already mapped. So
+    // the rename is answered where it happens rather than waited for on the next
+    // commit, which a window that has drawn itself once and gone quiet would never
+    // send. The app id decides the same question (only the shell's windows may be
+    // the note), so it gets the same treatment.
+    fn title_changed(&mut self, _surface: ToplevelSurface) {
+        self.refresh_keyboard_focus();
+    }
+
+    fn app_id_changed(&mut self, _surface: ToplevelSurface) {
+        self.refresh_keyboard_focus();
     }
 
     fn new_popup(&mut self, surface: PopupSurface, _positioner: PositionerState) {

@@ -69,10 +69,10 @@ reads.
 {"id": 5, "ok": {
   "focus": {"app": "plex"},
   "idle_inhibited": true,
-  "version": "0.1.10",
+  "version": "0.1.11",
   "windows": [
-    {"app_id": "mpv", "title": "a film", "keyboard": false},
-    {"app_id": "tvbox-shell", "title": "tvbox", "keyboard": true}
+    {"app_id": "mpv", "title": "a film", "mapped": true, "keyboard": false},
+    {"app_id": "tvbox-shell", "title": "tvbox", "mapped": true, "keyboard": true}
   ]
 }}
 ```
@@ -86,20 +86,35 @@ appends. Builds before 0.1.10 do not send the field at all, which is the honest
 answer for them.
 
 `windows` is back to front, so the last entry is the one on top, and `keyboard`
-marks the surface that receives key events. Both answers come from the same rule
-that decides what is drawn over what, which makes this the question to ask when a
-key ends up somewhere unexpected: a film that answers the remote is a film that is
-in front of the UI, whatever the screen looks like.
+marks the surface that receives key events. They come from the same order, which
+makes this the question to ask when a key ends up somewhere unexpected: a film that
+answers the remote is a film that is in front of the UI, whatever the screen looks
+like. `mapped` says whether a window has drawn anything yet; a toplevel is listed
+from the moment it appears, which is before its first buffer. Builds before 0.1.11
+do not send that field, the same way builds before 0.1.10 do not send `version`.
 
-One window is the exception to "in front means the keyboard": a **shell** window
-whose TITLE is `tvbox-overlay` (or whatever `TVBOX_OVERLAY_TITLE` says) is drawn in
-front of everything, the rest of the shell included, and is never given key events.
-It is how a note appears over a running app without that app losing the remote.
+Two things separate "in front" from "holds the keyboard", and both can be read off
+the list above.
+
+The first is the note. A **shell** window whose TITLE is `tvbox-overlay` (or
+whatever `TVBOX_OVERLAY_TITLE` says) is drawn in front of everything, the rest of
+the shell included, and is never given key events. It is how a note appears over a
+running app without that app losing the remote.
+
+The second is `mapped`. A window that has drawn something is preferred over one
+that has not, so a toplevel that has only just appeared does not take the remote
+from what is on screen. It is a preference and not a rule: with nothing mapped at
+all the keyboard still goes to the window on its way in, because every app switch
+tears the outgoing window down before the incoming one has painted, and answering
+"nobody" there loses a press.
 
 The title rather than an app id, because every window of one Chromium process
 presents the same app id - the launcher, an app and a note are all `tvbox-shell`,
-and only the title varies per window. The app id still has to match the shell's, so
-a page cannot put itself in front by renaming its document.
+and only the title varies per window. The app id has to match the shell's, which
+keeps every other client out of the note's slot; it does not keep out a page inside
+one of the shell's own windows, since that page is behind the shell's app id
+already. What stops a page naming itself into the front is the shell refusing the
+reserved title on the windows it hands a page.
 
 It is an ordinary window otherwise, so it is a scan-out candidate like the rest: a
 SMALL one can take a hardware plane rather than costing a composited pass over the
