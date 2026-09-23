@@ -19,7 +19,7 @@ use smithay::backend::renderer::element::surface::{
 };
 use smithay::backend::renderer::element::Kind;
 use smithay::backend::renderer::gles::GlesRenderer;
-use smithay::desktop::{layer_map_for_output, Space, Window};
+use smithay::desktop::{layer_map_for_output, PopupManager, Space, Window};
 use smithay::input::pointer::CursorImageStatus;
 use smithay::output::Output;
 use smithay::utils::{Logical, Physical, Point, Scale};
@@ -80,6 +80,20 @@ pub fn elements(
             continue;
         };
         let location: Point<i32, Physical> = geometry.loc.to_physical_precise_round(scale);
+        // A window's popups (a menu, a <select>) are drawn over it. They are not
+        // subsurfaces, so the surface tree alone never contains them.
+        for (popup, offset) in PopupManager::popups_for_surface(&surface) {
+            let offset = (window.geometry().loc + offset - popup.geometry().loc)
+                .to_physical_precise_round(scale);
+            elements.extend(render_elements_from_surface_tree(
+                renderer,
+                popup.wl_surface(),
+                location + offset,
+                scale,
+                1.0,
+                Kind::ScanoutCandidate,
+            ));
+        }
         elements.extend(render_elements_from_surface_tree(
             renderer,
             &surface,

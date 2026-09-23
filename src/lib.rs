@@ -37,7 +37,7 @@ use smithay::input::pointer::CursorImageStatus;
 use smithay::input::SeatState;
 use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::signals::{Signal, Signals};
-use smithay::reexports::calloop::{EventLoop, Interest, Mode, PostAction};
+use smithay::reexports::calloop::{channel, EventLoop, Interest, Mode, PostAction};
 use smithay::reexports::wayland_server::{Display, DisplayHandle};
 use smithay::wayland::compositor::CompositorState;
 use smithay::wayland::dmabuf::{DmabufFeedbackBuilder, DmabufState};
@@ -45,6 +45,7 @@ use smithay::wayland::idle_inhibit::IdleInhibitManagerState;
 use smithay::wayland::input_method::InputMethodManagerState;
 use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::presentation::PresentationState;
+use smithay::wayland::security_context::SecurityContextState;
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::shell::wlr_layer::WlrLayerShellState;
 use smithay::wayland::shell::xdg::decoration::XdgDecorationState;
@@ -57,7 +58,7 @@ use smithay::wayland::viewporter::ViewporterState;
 use tracing::{info, warn};
 
 use crate::backend::Tty;
-use crate::state::{ClientState, Tvbox};
+use crate::state::{client_trusted, Tvbox};
 
 /// How long a button must be held before it starts repeating, in milliseconds.
 const REPEAT_DELAY_MS: i32 = 450;
@@ -95,6 +96,18 @@ pub fn run(options: cli::Options) -> Result<()> {
         .context("failed to add a keyboard")?;
     seat.add_pointer();
 
+    // Every client reports its disconnect here, so what the compositor keeps on a
+    // client's behalf can go when the client does.
+    let (client_disconnects, disconnected) = channel::channel();
+    event_loop
+        .handle()
+        .insert_source(disconnected, |event, _, state: &mut Tvbox| {
+            if let channel::Event::Msg(client) = event {
+                state.on_client_disconnected(client);
+            }
+        })
+        .map_err(|err| anyhow::anyhow!("failed to watch for disconnects: {err}"))?;
+
     let mut state = Tvbox {
         running: Arc::new(AtomicBool::new(true)),
         display_handle: display_handle.clone(),
@@ -117,7 +130,20 @@ pub fn run(options: cli::Options) -> Result<()> {
         // before the game starts.
         idle_inhibit_state: IdleInhibitManagerState::new::<Tvbox>(&display_handle),
         idle_inhibitors: Vec::new(),
-        layer_shell_state: WlrLayerShellState::new::<Tvbox>(&display_handle),
+        // Nothing on the box draws on a layer, and a layer surface is drawn over
+        // every window and may hold the keyboard: a sandboxed app is not offered one.
+        layer_shell_state: WlrLayerShellState::new_with_filter::<Tvbox, _>(
+            &display_handle,
+            client_trusted,
+        ),
+        // Only for clients that are not already inside one: a sandboxed app must not
+        // be able to mint a context of its own.
+        security_context_state: SecurityContextState::new::<Tvbox, _>(
+            &display_handle,
+            client_trusted,
+        ),
+        client_disconnects,
+        shell_clients: Default::default(),
         dmabuf_state: DmabufState::new(),
         dmabuf_global: None,
         seat,
@@ -148,13 +174,16 @@ pub fn run(options: cli::Options) -> Result<()> {
         PresentationState::new::<Tvbox>(&display_handle, libc::CLOCK_MONOTONIC as u32);
     let _single_pixel = SinglePixelBufferState::new::<Tvbox>(&display_handle);
     // The shell types into a focused field from its on-screen keyboard or a paired
-    // phone. Chromium acts on text-input-v3, so the compositor sends the text there
-    // rather than synthesising key events, which would need a keymap carrying every
-    // character in the string.
+    // phone, and a client that speaks text-input-v3 is offered the string there
+    // before the keys go out (see typing.rs).
     let _text_input = TextInputManagerState::new::<Tvbox>(&display_handle);
-    // Smithay only activates a text input while an input method exists, so one is
-    // advertised even though nothing else uses it.
-    let _input_method = InputMethodManagerState::new::<Tvbox, _>(&display_handle, |_client| true);
+    // The input method global exists for the handler smithay's text input needs,
+    // and is offered to no client. A bound input method takes a keyboard grab that
+    // receives every key before the focused window does, reads the focused field's
+    // text and can commit into it - a keylogger that also takes the remote - and
+    // nothing on the box is an input method: the on-screen keyboard is the shell's
+    // own UI.
+    let _input_method = InputMethodManagerState::new::<Tvbox, _>(&display_handle, |_client| false);
 
     state.tty.bind_wl_display(&display_handle);
     if let Some(node) = state.tty.render_node() {
@@ -227,10 +256,8 @@ pub fn run(options: cli::Options) -> Result<()> {
     event_loop
         .handle()
         .insert_source(socket, move |stream, _, state| {
-            if let Err(err) = state
-                .display_handle
-                .insert_client(stream, Arc::new(ClientState::default()))
-            {
+            let data = state.client_state(None);
+            if let Err(err) = state.display_handle.insert_client(stream, Arc::new(data)) {
                 warn!(?err, "failed to accept a client");
             }
         })
@@ -254,9 +281,6 @@ pub fn run(options: cli::Options) -> Result<()> {
         std::path::PathBuf::from(runtime_dir).join("tvbox-wc.sock"),
     )?;
 
-    unsafe { std::env::set_var("WAYLAND_DISPLAY", &socket_name) };
-    // The shell finds the control socket the same way it finds the display.
-    unsafe { std::env::set_var("TVBOX_WC_SOCKET", &control_socket) };
     info!(socket = ?socket_name, control = ?control_socket, "tvbox-wc is up");
 
     backend::render(&mut state);
@@ -264,9 +288,16 @@ pub fn run(options: cli::Options) -> Result<()> {
     // The session starts only now: it opens the display connection in its first
     // milliseconds, and a socket that is not listening yet is a client that exits.
     let session = match options.session {
+        // The session finds the display and the control socket in its environment.
+        // Set on the child rather than on this process: the renderer is up by now,
+        // and Mesa's threads may be reading the environment while it is written.
         Some(command) => Some(session::spawn(
             &event_loop.handle(),
             command,
+            &[
+                ("WAYLAND_DISPLAY", socket_name.as_os_str()),
+                ("TVBOX_WC_SOCKET", control_socket.as_os_str()),
+            ],
             state.running.clone(),
         )?),
         None => None,

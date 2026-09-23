@@ -21,6 +21,17 @@
 //! Buffers we allocated ourselves still go through gbm: they are RGB, gbm describes
 //! them correctly, and it keeps the bo's own metadata in play.
 //!
+//! The import happens on a DRM file of its own. GEM handles belong to the file they
+//! were created on, `drmPrimeFDToHandle` answers with a handle that file ALREADY
+//! holds for the same buffer without taking a reference, and the renderer imports
+//! every client dmabuf on the session's file. Closing "our" handle there after
+//! AddFB2 would close the renderer's, and the kernel hands the freed id to the next
+//! import - so a later close by the renderer lands on some other buffer. A second
+//! `open()` of the card (not a `dup`, which shares the handle table) has handles
+//! nobody else knows about. Framebuffer ids are device-wide, so the framebuffer made
+//! there is used by the session's atomic commits like any other; it is removed on
+//! the file that made it.
+//!
 //! [`GbmFramebufferExporter`]: smithay::backend::drm::exporter::gbm::GbmFramebufferExporter
 
 use smithay::backend::allocator::{
@@ -35,14 +46,48 @@ use smithay::reexports::drm::{
     buffer::PlanarBuffer,
     control::{framebuffer, Device as ControlDevice, FbCmd2Flags},
 };
+use std::sync::Arc;
 use tracing::{trace, warn};
+
+/// A second, unprivileged file on the display device that client buffers are
+/// imported on. See the module documentation for why it is not the session's.
+#[derive(Debug)]
+pub struct ImportDevice(std::fs::File);
+
+impl ImportDevice {
+    /// Open the card a second time.
+    pub fn open(path: &std::path::Path) -> std::io::Result<Self> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOCTTY)
+            .open(path)
+            .map(ImportDevice)
+    }
+}
+
+impl std::os::unix::io::AsFd for ImportDevice {
+    fn as_fd(&self) -> std::os::unix::io::BorrowedFd<'_> {
+        self.0.as_fd()
+    }
+}
+impl smithay::reexports::drm::Device for ImportDevice {}
+impl ControlDevice for ImportDevice {}
+
+/// The file a framebuffer was made on, which is the one that may remove it.
+#[derive(Debug)]
+enum Owner {
+    Session(DrmDeviceFd),
+    Import(Arc<ImportDevice>),
+}
 
 /// A framebuffer we own: destroyed with the handle when dropped.
 #[derive(Debug)]
 pub struct DirectFramebuffer {
     handle: framebuffer::Handle,
     format: Format,
-    drm: DrmDeviceFd,
+    owner: Owner,
 }
 
 impl AsRef<framebuffer::Handle> for DirectFramebuffer {
@@ -59,7 +104,11 @@ impl Framebuffer for DirectFramebuffer {
 
 impl Drop for DirectFramebuffer {
     fn drop(&mut self) {
-        if let Err(err) = self.drm.destroy_framebuffer(self.handle) {
+        let result = match &self.owner {
+            Owner::Session(drm) => drm.destroy_framebuffer(self.handle),
+            Owner::Import(import) => import.destroy_framebuffer(self.handle),
+        };
+        if let Err(err) = result {
             warn!(fb = ?self.handle, ?err, "failed to destroy framebuffer");
         }
     }
@@ -116,9 +165,20 @@ pub enum Error {
 
 /// Exports framebuffers for the compositor's DRM surface.
 ///
-/// Client dmabufs are imported directly; our own buffers go through gbm.
+/// Client dmabufs are imported directly, on [`ImportDevice`] when there is one;
+/// our own buffers go through gbm.
 #[derive(Debug, Clone)]
-pub struct DirectFramebufferExporter;
+pub struct DirectFramebufferExporter {
+    import: Option<Arc<ImportDevice>>,
+}
+
+impl DirectFramebufferExporter {
+    /// An exporter importing client buffers on `import`, or on the session's file
+    /// when the card could not be opened a second time.
+    pub fn new(import: Option<Arc<ImportDevice>>) -> Self {
+        DirectFramebufferExporter { import }
+    }
+}
 
 impl ExportFramebuffer<GbmBuffer> for DirectFramebufferExporter {
     type Framebuffer = ExportedFramebuffer;
@@ -143,8 +203,24 @@ impl ExportFramebuffer<GbmBuffer> for DirectFramebufferExporter {
                     return Ok(None);
                 }
 
-                framebuffer_from_dmabuf(drm, dmabuf, use_opaque)
-                    .map(|fb| Some(ExportedFramebuffer::Direct(fb)))
+                let framebuffer =
+                    match &self.import {
+                        Some(import) => framebuffer_from_dmabuf(&**import, dmabuf, use_opaque).map(
+                            |(handle, format)| DirectFramebuffer {
+                                handle,
+                                format,
+                                owner: Owner::Import(import.clone()),
+                            },
+                        ),
+                        None => framebuffer_from_dmabuf(drm, dmabuf, use_opaque).map(
+                            |(handle, format)| DirectFramebuffer {
+                                handle,
+                                format,
+                                owner: Owner::Session(drm.clone()),
+                            },
+                        ),
+                    };
+                framebuffer.map(|fb| Some(ExportedFramebuffer::Direct(fb)))
             }
             ExportBuffer::Allocator(bo) => framebuffer_from_bo(drm, bo, use_opaque)
                 .map(|fb| Some(ExportedFramebuffer::Gbm(fb)))
@@ -213,11 +289,11 @@ impl PlanarBuffer for ImportedDmabuf<'_> {
 }
 
 /// Build a framebuffer from a dmabuf by importing its plane fds on `drm`.
-pub fn framebuffer_from_dmabuf(
-    drm: &DrmDeviceFd,
+fn framebuffer_from_dmabuf<D: ControlDevice>(
+    drm: &D,
     dmabuf: &Dmabuf,
     use_opaque: bool,
-) -> Result<DirectFramebuffer, Error> {
+) -> Result<(framebuffer::Handle, Format), Error> {
     let mut handles = [None; 4];
     let mut imported = Vec::with_capacity(4);
     for (index, fd) in dmabuf.handles().enumerate().take(4) {
@@ -263,14 +339,10 @@ pub fn framebuffer_from_dmabuf(
     let handle = result.map_err(|source| Error::AddFramebuffer { format, source })?;
     trace!(?format, ?handle, "imported a dmabuf for scan-out");
 
-    Ok(DirectFramebuffer {
-        handle,
-        format,
-        drm: drm.clone(),
-    })
+    Ok((handle, format))
 }
 
-fn close_all(drm: &DrmDeviceFd, handles: &[smithay::reexports::drm::buffer::Handle]) {
+fn close_all<D: ControlDevice>(drm: &D, handles: &[smithay::reexports::drm::buffer::Handle]) {
     for handle in handles {
         if let Err(err) = drm.close_buffer(*handle) {
             warn!(?handle, ?err, "failed to close an imported buffer handle");

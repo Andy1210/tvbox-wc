@@ -1,8 +1,9 @@
 //! The display hardware: session, DRM device, output and the render loop.
 //!
-//! One device, one output, no hotplug of GPUs. That is not a simplification to be
-//! fixed later - the box has a single HDMI connector and a soldered-on GPU, and
-//! every branch that pretends otherwise is a branch nobody can test here.
+//! One device, one output, no hotplug of GPUs. The output is the first connector
+//! found connected when the compositor starts (or the first to appear, when none
+//! is), and it stays bound for the compositor's lifetime: a board with a second
+//! HDMI port drives one display, the one plugged in at start.
 //!
 //! The Pi's split between a render-only node (v3d) and a display-only node (vc4) is
 //! handled by Mesa: a gbm device on the display node renders through v3d, which is
@@ -58,6 +59,29 @@ pub struct Surface {
     pub redraw_needed: bool,
     /// A render is already scheduled for this turn of the event loop.
     pub redraw_queued: bool,
+    /// Counts queued frames, so a watchdog can tell whether the flip it is watching
+    /// is still the one in flight.
+    pub frame_serial: u64,
+    /// Frame callbacks are already due from a timer, for a frame that put nothing
+    /// new on screen.
+    pub frames_timer_armed: bool,
+}
+
+impl Surface {
+    /// Forget the flip in flight, as if its vblank had arrived.
+    ///
+    /// For when its event cannot come any more: the display went away, the session
+    /// lost the device, or the event was simply never delivered. `DrmCompositor`
+    /// keeps its own record of a pending frame, which `reset_state` leaves alone, and
+    /// while that record is set a queued frame is held back rather than submitted -
+    /// clearing only our flag would leave the screen frozen for good.
+    pub fn abandon_pending_frame(&mut self) {
+        self.frame_pending = false;
+        self.redraw_needed = true;
+        if let Err(err) = self.compositor.frame_submitted() {
+            warn!(?err, "failed to drop the pending frame");
+        }
+    }
 }
 
 /// An opened DRM device and everything hanging off it.
@@ -70,6 +94,9 @@ pub struct Device {
     pub renderer: GlesRenderer,
     /// The output, once a connector is up.
     pub surface: Option<Surface>,
+    /// A second file on the same card, that client buffers are imported on for
+    /// scan-out. See `kms::framebuffer`.
+    pub import: Option<std::sync::Arc<crate::kms::framebuffer::ImportDevice>>,
 }
 
 /// The display side of the compositor.
@@ -115,11 +142,23 @@ impl Tty {
         let egl_context = EGLContext::new(&egl_display).context("EGLContext::new")?;
         let renderer = unsafe { GlesRenderer::new(egl_context) }.context("GlesRenderer::new")?;
 
+        let import = match crate::kms::framebuffer::ImportDevice::open(&path) {
+            Ok(import) => Some(std::sync::Arc::new(import)),
+            Err(err) => {
+                warn!(
+                    ?err,
+                    "could not open the card a second time; client buffers are imported on the session's file"
+                );
+                None
+            }
+        };
+
         self.device = Some(Device {
             drm,
             gbm,
             renderer,
             surface: None,
+            import,
         });
 
         // The caller inserts this into the event loop; returning it here would make
@@ -215,7 +254,7 @@ impl Tty {
             drm_surface,
             None,
             allocator,
-            DirectFramebufferExporter,
+            DirectFramebufferExporter::new(device.import.clone()),
             // Opaque first: an alpha channel on the primary plane costs bandwidth
             // for a channel nothing below can use.
             [
@@ -243,6 +282,8 @@ impl Tty {
             frame_pending: false,
             redraw_needed: true,
             redraw_queued: false,
+            frame_serial: 0,
+            frames_timer_armed: false,
         });
 
         Ok(Some(output))
@@ -325,6 +366,23 @@ impl Tty {
         hdr.set(device.drm.device_fd(), surface.connector, on)?;
         info!(output = name, on, "HDR claim");
         Ok(())
+    }
+
+    /// Give back an HDR claim, if one is in effect.
+    pub fn release_hdr(&mut self) {
+        let Some(device) = self.device.as_mut() else {
+            return;
+        };
+        let Some(surface) = device.surface.as_mut() else {
+            return;
+        };
+        let Some(hdr) = surface.hdr.as_mut().filter(|hdr| hdr.claimed()) else {
+            return;
+        };
+        match hdr.set(device.drm.device_fd(), surface.connector, false) {
+            Ok(()) => info!("released the HDR claim"),
+            Err(err) => warn!(?err, "failed to release the HDR claim"),
+        }
     }
 
     /// Whether the output has a colour space claimed.
@@ -517,12 +575,11 @@ impl Tty {
         }
         info!("the display came back");
         surface.asleep = false;
-        // Whatever happens below, drawing has to be possible again: every early
-        // return here used to leave frame_pending set from the frame that was in
-        // flight when the TV went away, and then nothing ever drew - the set comes
-        // back on to a black screen.
-        surface.frame_pending = false;
-        surface.redraw_needed = true;
+        // Whatever happens below, drawing has to be possible again. The frame that
+        // was in flight when the TV went away will never report its vblank, and
+        // leaving it pending means nothing is ever drawn again - the set comes back
+        // on to a black screen.
+        surface.abandon_pending_frame();
 
         // Re-apply what the shell asked for if the display still offers it. Falling
         // back to the preferred mode is what makes a TV that was switched off during
@@ -717,6 +774,7 @@ pub fn render(state: &mut crate::state::Tvbox) {
     // ask for one - a vblank never arrives for a frame that was never queued, and a
     // static launcher screen commits nothing.
     let mut retry = false;
+    let mut queued = None;
 
     // ALLOW_PRIMARY_PLANE_SCANOUT_ANY is the load-bearing flag, and it is not in
     // DEFAULT: without it an element may only take the primary plane when its format
@@ -750,6 +808,8 @@ pub fn render(state: &mut crate::state::Tvbox) {
             } else {
                 surface.frame_pending = true;
                 surface.redraw_needed = false;
+                surface.frame_serial += 1;
+                queued = Some(surface.frame_serial);
             }
         }
         Err(err) => {
@@ -758,7 +818,59 @@ pub fn render(state: &mut crate::state::Tvbox) {
         }
     }
 
-    crate::render::send_frames(&state.space, &output);
+    // A frame that went to the display is followed by its vblank, and the clients
+    // are told they may draw now so the next one is ready by then. One that put
+    // nothing new on screen has no vblank to wait for, and answering its callbacks
+    // at once lets a client that commits without new content go round as fast as
+    // the loop turns - so they wait out a refresh instead.
+    let interval = frame_interval(&output);
+    if queued.is_some() {
+        crate::render::send_frames(&state.space, &output);
+    } else if !surface.frames_timer_armed {
+        surface.frames_timer_armed = true;
+        let timer = smithay::reexports::calloop::timer::Timer::from_duration(interval);
+        let _ = state.loop_handle.insert_source(timer, |_, _, state| {
+            if let Some(surface) = state
+                .tty
+                .device
+                .as_mut()
+                .and_then(|device| device.surface.as_mut())
+            {
+                surface.frames_timer_armed = false;
+            }
+            if let Some(output) = state.output.clone() {
+                crate::render::send_frames(&state.space, &output);
+            }
+            smithay::reexports::calloop::timer::TimeoutAction::Drop
+        });
+    }
+
+    // A flip whose event never arrives would hold every later frame back, and
+    // nothing else would notice: the picture just stops. Give it a generous number
+    // of refreshes and then carry on as if it had completed.
+    if let Some(serial) = queued {
+        let timer = smithay::reexports::calloop::timer::Timer::from_duration(
+            interval * FLIP_WATCHDOG_FRAMES,
+        );
+        let _ = state.loop_handle.insert_source(timer, move |_, _, state| {
+            // A paused session has its own recovery when the device comes back.
+            if !state.tty.is_active() {
+                return smithay::reexports::calloop::timer::TimeoutAction::Drop;
+            }
+            let stuck = state
+                .tty
+                .device
+                .as_mut()
+                .and_then(|device| device.surface.as_mut())
+                .filter(|surface| surface.frame_pending && surface.frame_serial == serial);
+            if let Some(surface) = stuck {
+                warn!("a page flip never completed - carrying on without it");
+                surface.abandon_pending_frame();
+                state.queue_redraw();
+            }
+            smithay::reexports::calloop::timer::TimeoutAction::Drop
+        });
+    }
 
     if retry {
         let timer = smithay::reexports::calloop::timer::Timer::from_duration(RETRY_AFTER);
@@ -767,6 +879,19 @@ pub fn render(state: &mut crate::state::Tvbox) {
             smithay::reexports::calloop::timer::TimeoutAction::Drop
         });
     }
+}
+
+/// How many refreshes a page flip may take before it is given up on.
+const FLIP_WATCHDOG_FRAMES: u32 = 30;
+
+/// One refresh of the output, for pacing frame callbacks that have no vblank.
+fn frame_interval(output: &Output) -> std::time::Duration {
+    let refresh = output
+        .current_mode()
+        .map(|mode| mode.refresh)
+        .filter(|refresh| *refresh > 0)
+        .unwrap_or(60_000);
+    std::time::Duration::from_micros(1_000_000_000 / refresh as u64)
 }
 
 /// A page flip completed.
@@ -803,11 +928,10 @@ pub fn on_session_event(state: &mut crate::state::Tvbox, active: bool) {
             warn!(?err, "failed to activate the DRM device");
         }
         if let Some(surface) = device.surface.as_mut() {
-            surface.frame_pending = false;
-            surface.redraw_needed = true;
             if let Err(err) = surface.compositor.reset_state() {
                 warn!(?err, "failed to reset the compositor state");
             }
+            surface.abandon_pending_frame();
         }
         render(state);
     } else {

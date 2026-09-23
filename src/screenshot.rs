@@ -78,8 +78,7 @@ pub fn capture(
 }
 
 fn write_png(path: &Path, width: i32, height: i32, pixels: &[u8]) -> Result<()> {
-    let file = std::fs::File::create(path)
-        .with_context(|| format!("failed to create {}", path.display()))?;
+    let file = open_target(path)?;
     let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width as u32, height as u32);
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
@@ -90,4 +89,85 @@ fn write_png(path: &Path, width: i32, height: i32, pixels: &[u8]) -> Result<()> 
         .write_image_data(pixels)
         .context("failed to write the image")?;
     Ok(())
+}
+
+/// Open the file a screenshot is written to.
+///
+/// The path comes from whoever is at the other end of the control socket, so the
+/// compositor does not follow a symlink there, writes only a regular file, and
+/// creates it for its own user alone: a screenshot shows whatever is on the screen,
+/// a sign-in code included. An absolute path, because the compositor's working
+/// directory is nobody's business.
+fn open_target(path: &Path) -> Result<std::fs::File> {
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    anyhow::ensure!(path.is_absolute(), "a screenshot path must be absolute");
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .with_context(|| format!("failed to create {}", path.display()))?;
+    let metadata = file
+        .metadata()
+        .context("failed to read the screenshot file")?;
+    anyhow::ensure!(
+        metadata.is_file(),
+        "{} is not a regular file",
+        path.display()
+    );
+    // An existing file is only replaced when it is ours, and it keeps no other
+    // reader: its mode is brought down to the one a new file gets.
+    anyhow::ensure!(
+        std::os::unix::fs::MetadataExt::uid(&metadata) == unsafe { libc::geteuid() },
+        "{} belongs to another user",
+        path.display()
+    );
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .context("failed to restrict the screenshot file")?;
+    file.set_len(0)
+        .context("failed to truncate the screenshot file")?;
+    Ok(file)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("tvbox-wc-shot-{}", std::process::id()));
+        let _ = std::fs::create_dir(&dir);
+        dir
+    }
+
+    #[test]
+    fn a_symlink_is_not_followed() {
+        let dir = scratch();
+        let target = dir.join("target");
+        std::fs::write(&target, b"keep").unwrap();
+        let link = dir.join("link.png");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(open_target(&link).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn a_relative_path_is_refused() {
+        assert!(open_target(Path::new("shot.png")).is_err());
+    }
+
+    #[test]
+    fn a_new_file_is_private_and_an_old_one_is_replaced() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = scratch();
+        let path = dir.join("shot.png");
+        std::fs::write(&path, b"an older, longer screenshot").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        drop(open_target(&path).unwrap());
+        let metadata = std::fs::metadata(&path).unwrap();
+        assert_eq!(metadata.len(), 0);
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    }
 }

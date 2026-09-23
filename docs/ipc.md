@@ -2,7 +2,7 @@
 
 The shell drives the compositor over a unix socket: one JSON object per line,
 request and response matched by `id`. The path is in `TVBOX_WC_SOCKET`, which the
-compositor exports for its children, and defaults to
+compositor sets in the session's environment, and defaults to
 `$XDG_RUNTIME_DIR/tvbox-wc.sock`.
 
 The framing is deliberately the same as mpv's control socket. The shell already
@@ -10,7 +10,18 @@ speaks it, so this needs no new client code, and a person can drive it from a
 terminal with `tools/wcctl.py`.
 
 Access control is the socket's own: it lives in the session user's runtime
-directory. Anything that can reach it can already reach the Wayland socket.
+directory, is mode 0600, and a connection from another uid is refused. A sandboxed
+app (Flatpak) gets a private runtime directory holding only the Wayland socket, so
+it cannot reach this one; an unsandboxed program running as the session user can.
+
+## Sandboxed clients
+
+The compositor offers `wp_security_context_v1`, and a client that connects through
+a security context (which is how Flatpak connects its apps) is treated as
+untrusted: it is not offered the layer shell, it never ranks as the shell or the
+overlay whatever app id and title it presents, and a title never places one of its
+windows. The input method global is offered to no client at all; nothing on the
+box is one, and a bound input method would see every key.
 
 ## Requests
 
@@ -53,6 +64,12 @@ playback.
 A claim, not a setting. The colour space covers the whole output, so while it is
 held the SDR UI on its overlay plane is read as PQ. Claim it for the duration of PQ
 playback and release it after, the same way the mode is claimed.
+
+A claim does not outlive the shell. When the shell's Wayland connection closes
+(it crashed, or is restarting), the compositor releases the claim, forgets the
+reported focus and drops every placement, so a respawned shell starts from a clean
+screen. A claim left on the connector by a previous compositor is released at
+start.
 
 `get_outputs` reports `"hdr": {"supported": true, "on": false}`. `supported` means
 the driver exposes the connector properties a claim needs; it says nothing about
@@ -149,7 +166,9 @@ This is how picture-in-picture works. A Wayland client cannot place itself, whic
 why the shell used to run the player under XWayland for it; the compositor can, so
 the player is an ordinary Wayland client either way.
 
-Name the windows by `app_id` **or** by `title`, not both:
+Name the windows by `app_id` **or** by `title`, not both. The shell's own app id is
+refused: every one of its windows carries it, the launcher included, so a placement
+by it would move the whole UI.
 
 ```json
 {"id": 10, "request": "place_window", "title": "tvbox-overlay", "x": 0, "y": 900, "w": 1920, "h": 180}
@@ -198,10 +217,11 @@ because there is nothing to negotiate.
 `keys` is how many key presses went out.
 
 The focused client's text input is offered the same string first, for clients that
-speak text-input-v3 and would rather take it whole. Whether that lands is out of
-our hands: smithay discards a client's `enable` while no input-method client is
-bound, so the text input never becomes active and `done` is never sent. The keys go
-out either way, which is why typing works regardless.
+speak text-input-v3 and would rather take it whole. It does not land today:
+smithay discards a client's `enable` while no input-method client is bound, and the
+input method global is offered to nobody (see above), so the text input never
+becomes active and `done` is never sent. The keys go out either way, which is why
+typing works regardless.
 
 ### `screenshot`
 
@@ -210,7 +230,10 @@ out either way, which is why typing works regardless.
 {"id": 6, "ok": {"path": "/tmp/screen.png", "w": 1360, "h": 768}}
 ```
 
-Renders the scene off-screen and writes a PNG. It exists for measurement: with the
+Renders the scene off-screen and writes a PNG. The path must be absolute; a symlink
+there is not followed, an existing file is only replaced when it is a regular file
+of the session user, and the file is written mode 0600, since a screenshot shows
+whatever is on the screen. It exists for measurement: with the
 video on a plane and the compositor doing no GPU work, "everything is fine" reads
 the same as a frozen screen in every counter, twice measured. Two shots a few
 seconds apart, compared, is the cheapest honest check that a client is drawing.

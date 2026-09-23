@@ -2,8 +2,8 @@
 //!
 //! The window management here is deliberately thin. A TV box shows one thing at a
 //! time: a toplevel is always fullscreen on the single output, and the shell's UI
-//! rides on layer-shell above it. There is no stacking to speak of, no focus
-//! follows anything, and no decorations.
+//! is an ordinary toplevel kept in front by [`crate::stacking`]. No focus follows
+//! anything, and there are no decorations.
 
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -11,14 +11,16 @@ use std::sync::Arc;
 use smithay::backend::renderer::element::default_primary_scanout_output_compare;
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
 use smithay::desktop::{
-    layer_map_for_output, LayerSurface, PopupManager, Space, Window, WindowSurfaceType,
+    layer_map_for_output, LayerSurface, PopupKind, PopupManager, Space, Window,
+    WindowSurfaceType,
 };
 use smithay::input::{pointer::CursorImageStatus, Seat, SeatHandler, SeatState};
 use smithay::output::Output;
-use smithay::reexports::calloop::LoopHandle;
+use smithay::reexports::calloop::{channel, LoopHandle};
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::protocol::{wl_seat, wl_surface::WlSurface};
-use smithay::reexports::wayland_server::{Client, DisplayHandle};
+use smithay::reexports::wayland_server::backend::{ClientId, DisconnectReason};
+use smithay::reexports::wayland_server::{Client, DisplayHandle, Resource as _};
 use smithay::utils::{IsAlive, Logical, Point, Rectangle, Serial};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
@@ -28,12 +30,16 @@ use smithay::wayland::compositor::{
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier};
 use smithay::wayland::output::OutputHandler;
 use smithay::wayland::seat::WaylandFocus;
+use smithay::wayland::security_context::{
+    SecurityContext, SecurityContextHandler, SecurityContextListenerSource, SecurityContextState,
+};
 use smithay::wayland::selection::data_device::{
     DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler,
 };
 use smithay::wayland::selection::SelectionHandler;
 use smithay::wayland::shell::wlr_layer::{
-    Layer, LayerSurface as WlrLayerSurface, WlrLayerShellHandler, WlrLayerShellState,
+    KeyboardInteractivity, Layer, LayerSurface as WlrLayerSurface, WlrLayerShellHandler,
+    WlrLayerShellState,
 };
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
 use smithay::wayland::idle_inhibit::{IdleInhibitHandler, IdleInhibitManagerState};
@@ -72,9 +78,43 @@ pub enum Focus {
 pub struct ClientState {
     /// Surface bookkeeping smithay does on our behalf.
     pub compositor_state: CompositorClientState,
+    /// Set for a client that connected through a security context, which is how a
+    /// sandbox (Flatpak) hands the compositor a connection it made on an app's
+    /// behalf. Such a client is not trusted: see [`client_trusted`].
+    pub security_context: Option<SecurityContext>,
+    /// Where the client's disconnect is reported, so per-client state the
+    /// compositor holds on its behalf can be dropped.
+    pub disconnects: Option<channel::Sender<ClientId>>,
 }
 
-impl smithay::reexports::wayland_server::backend::ClientData for ClientState {}
+impl smithay::reexports::wayland_server::backend::ClientData for ClientState {
+    fn disconnected(&self, client_id: ClientId, _reason: DisconnectReason) {
+        if let Some(sender) = &self.disconnects {
+            let _ = sender.send(client_id);
+        }
+    }
+}
+
+/// Whether a client may use what only the box's own programs need: the layer shell,
+/// a place in front of other windows, a title that places a window.
+///
+/// A client that came in through a security context is a sandboxed app, and it is
+/// exactly the kind of client those must not reach. Everything else connected to the
+/// compositor's own socket, which only the session user can open.
+pub fn client_trusted(client: &Client) -> bool {
+    client
+        .get_data::<ClientState>()
+        .map(|data| data.security_context.is_none())
+        .unwrap_or(false)
+}
+
+/// [`client_trusted`] for the client behind a surface.
+pub fn surface_trusted(surface: &WlSurface) -> bool {
+    surface
+        .client()
+        .map(|client| client_trusted(&client))
+        .unwrap_or(false)
+}
 
 /// Everything the compositor owns.
 pub struct Tvbox {
@@ -137,6 +177,15 @@ pub struct Tvbox {
     /// Where windows go. A window with no entry takes the whole output, which is
     /// what a TV box does with almost everything.
     pub placements: std::collections::HashMap<PlaceKey, Rectangle<i32, Logical>>,
+    /// Held for its global, which lets a sandbox hand over its app's connection
+    /// marked as untrusted.
+    #[allow(dead_code)]
+    pub security_context_state: SecurityContextState,
+    /// Handed to every client, so a disconnect reaches the event loop.
+    pub client_disconnects: channel::Sender<ClientId>,
+    /// The clients that have presented the shell's app id. When the last of them is
+    /// gone, so is the shell, and what it told the compositor goes with it.
+    pub shell_clients: std::collections::HashSet<ClientId>,
 }
 
 /// What a placement is keyed by.
@@ -154,6 +203,49 @@ pub enum PlaceKey {
 }
 
 impl Tvbox {
+    /// The state a new client starts with.
+    pub fn client_state(&self, security_context: Option<SecurityContext>) -> ClientState {
+        ClientState {
+            compositor_state: Default::default(),
+            security_context,
+            disconnects: Some(self.client_disconnects.clone()),
+        }
+    }
+
+    /// Remember the client behind a window if it is the shell's.
+    fn note_shell_client(&mut self, window: &Window) {
+        if !crate::stacking::is_shell(window) {
+            return;
+        }
+        if let Some(client) = window.wl_surface().and_then(|surface| surface.client()) {
+            self.shell_clients.insert(client.id());
+        }
+    }
+
+    /// A client went away.
+    ///
+    /// When it was the last one that spoke for the shell, what the shell told the
+    /// compositor describes a program that is no longer running: its idea of who
+    /// owns the screen, the rectangles it placed windows in, and an HDR claim made
+    /// for a film nobody is playing any more. A respawned shell starts from nothing
+    /// and says so again; until it does, the defaults are the right answer.
+    pub fn on_client_disconnected(&mut self, client: ClientId) {
+        if !self.shell_clients.remove(&client) || !self.shell_clients.is_empty() {
+            return;
+        }
+        info!("the shell's connection closed - dropping what it had set");
+        self.focus = Focus::Launcher;
+        self.placements.clear();
+        self.tty.release_hdr();
+        let windows: Vec<Window> = self.space.elements().cloned().collect();
+        for window in windows {
+            if crate::stacking::mapped(&window) {
+                self.place(&window);
+            }
+        }
+        self.queue_redraw();
+    }
+
     /// Find a mapped surface under a point, for pointer focus.
     pub fn surface_under(
         &self,
@@ -409,7 +501,8 @@ impl Tvbox {
     }
 
     /// Give the keyboard to whatever should have it now: the topmost layer surface
-    /// that asked for it, otherwise the frontmost window.
+    /// above the windows that asked for it exclusively, otherwise the frontmost
+    /// window.
     ///
     /// Asked on every commit, so it answers with silence when the answer has not
     /// changed. That is not only about cost: handing the focus out again takes the
@@ -420,15 +513,16 @@ impl Tvbox {
             return;
         };
 
-        let mut target = None;
-        if let Some(output) = self.output.as_ref() {
+        let target = self.output.as_ref().and_then(|output| {
             let layers = layer_map_for_output(output);
-            for layer in layers.layers() {
-                if layer.can_receive_keyboard_focus() {
-                    target = Some(layer.wl_surface().clone());
-                }
-            }
-        }
+            keyboard_layer(layers.layers().map(|layer| {
+                (
+                    layer.wl_surface().clone(),
+                    layer.layer(),
+                    layer.cached_state().keyboard_interactivity,
+                )
+            }))
+        });
         let target = target.or_else(|| {
             crate::stacking::topmost(&self.space)
                 .and_then(|window| window.wl_surface().map(|s| s.into_owned()))
@@ -486,6 +580,7 @@ impl CompositorHandler for Tvbox {
         }
         if let Some(window) = self.window_for_surface(&root) {
             window.on_commit();
+            self.note_shell_client(&window);
             // A TV box has one screen and one thing on it - but only once the client
             // has mapped. Forcing a size and the fullscreen state in the FIRST
             // configure makes a client resize before it has configured its video,
@@ -612,6 +707,17 @@ impl Tvbox {
 
     /// Send the first configure a surface is waiting for.
     fn ensure_initial_configure(&mut self, surface: &WlSurface) {
+        // A popup maps only after its first configure, and the popup manager sends
+        // none of its own: without this a menu or a <select> never appears.
+        if let Some(PopupKind::Xdg(popup)) = self.popups.find_popup(surface) {
+            if !popup.is_initial_configure_sent() {
+                if let Err(err) = popup.send_configure() {
+                    warn!(?err, "failed to configure a popup");
+                }
+            }
+            return;
+        }
+
         if let Some(window) = self.window_for_surface(surface) {
             if let Some(toplevel) = window.toplevel() {
                 let sent = with_states(surface, |states| {
@@ -760,7 +866,10 @@ impl XdgShellHandler for Tvbox {
         self.refresh_keyboard_focus();
     }
 
-    fn app_id_changed(&mut self, _surface: ToplevelSurface) {
+    fn app_id_changed(&mut self, surface: ToplevelSurface) {
+        if let Some(window) = self.window_for_surface(surface.wl_surface()) {
+            self.note_shell_client(&window);
+        }
         self.refresh_keyboard_focus();
     }
 
@@ -880,6 +989,31 @@ impl smithay::wayland::input_method::InputMethodHandler for Tvbox {
     }
 }
 
+/// A sandbox asked for a socket to hand to its app.
+///
+/// Connections on it are marked with the context, which is what keeps that app away
+/// from the globals and the stacking rank reserved for the box's own programs.
+impl SecurityContextHandler for Tvbox {
+    fn context_created(&mut self, source: SecurityContextListenerSource, context: SecurityContext) {
+        info!(
+            engine = ?context.sandbox_engine,
+            app = ?context.app_id,
+            "a sandbox created a security context"
+        );
+        let inserted = self
+            .loop_handle
+            .insert_source(source, move |stream, _, state| {
+                let data = state.client_state(Some(context.clone()));
+                if let Err(err) = state.display_handle.insert_client(stream, Arc::new(data)) {
+                    warn!(?err, "failed to accept a sandboxed client");
+                }
+            });
+        if let Err(err) = inserted {
+            warn!(?err, "failed to listen for a security context");
+        }
+    }
+}
+
 impl DmabufHandler for Tvbox {
     fn dmabuf_state(&mut self) -> &mut DmabufState {
         &mut self.dmabuf_state
@@ -920,6 +1054,28 @@ delegate_xdg_decoration!(Tvbox);
 delegate_idle_inhibit!(Tvbox);
 delegate_layer_shell!(Tvbox);
 delegate_dmabuf!(Tvbox);
+smithay::delegate_security_context!(Tvbox);
+
+/// The layer surface that takes the keyboard from the windows, if any.
+///
+/// Only one that asked for it EXCLUSIVELY, and only above the windows: the protocol
+/// gives the compositor the choice for on-demand interactivity, and with a remote
+/// and no pointer to click with, taking the keyboard for one would leave the
+/// windows deaf for as long as it is mapped. The front one wins, by layer first and
+/// map order within a layer.
+fn keyboard_layer<T>(
+    layers: impl IntoIterator<Item = (T, Layer, KeyboardInteractivity)>,
+) -> Option<T> {
+    layers
+        .into_iter()
+        .enumerate()
+        .filter(|(_, (_, layer, interactivity))| {
+            matches!(layer, Layer::Top | Layer::Overlay)
+                && *interactivity == KeyboardInteractivity::Exclusive
+        })
+        .max_by_key(|(index, (_, layer, _))| (*layer == Layer::Overlay, *index))
+        .map(|(_, (surface, _, _))| surface)
+}
 
 /// Keep smithay's idea of which output a surface is presented on up to date, so
 /// frame callbacks and presentation feedback go out at the right rate.
@@ -938,5 +1094,47 @@ pub fn refresh_primary_scanout_output(state: &mut Tvbox) {
                 default_primary_scanout_output_compare,
             );
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_an_exclusive_layer_above_the_windows_takes_the_keyboard() {
+        use KeyboardInteractivity::{Exclusive, OnDemand};
+        assert_eq!(
+            keyboard_layer(vec![("bg", Layer::Background, Exclusive)]),
+            Option::None
+        );
+        assert_eq!(
+            keyboard_layer(vec![("bar", Layer::Top, OnDemand)]),
+            Option::None
+        );
+        assert_eq!(
+            keyboard_layer(vec![("bar", Layer::Top, Exclusive)]),
+            Some("bar")
+        );
+    }
+
+    #[test]
+    fn the_overlay_layer_wins_over_a_later_top_layer() {
+        use KeyboardInteractivity::Exclusive;
+        assert_eq!(
+            keyboard_layer(vec![
+                ("lock", Layer::Overlay, Exclusive),
+                ("bar", Layer::Top, Exclusive),
+                ("widget", Layer::Background, Exclusive),
+            ]),
+            Some("lock")
+        );
+        assert_eq!(
+            keyboard_layer(vec![
+                ("first", Layer::Top, Exclusive),
+                ("second", Layer::Top, Exclusive),
+            ]),
+            Some("second")
+        );
     }
 }

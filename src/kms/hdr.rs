@@ -24,7 +24,7 @@ use smithay::reexports::drm::control::atomic::AtomicModeReq;
 use smithay::reexports::drm::control::{
     connector, property, AtomicCommitFlags, Device as ControlDevice,
 };
-use tracing::debug;
+use tracing::{debug, info, warn};
 
 /// SMPTE ST 2084, the transfer function every HDR10 film uses.
 const EOTF_PQ: u8 = 2;
@@ -32,6 +32,8 @@ const EOTF_PQ: u8 = 2;
 /// driver negotiates a subsampling that fits, and drops back if the mode cannot
 /// carry it.
 const HDR_BPC: u64 = 10;
+/// Bits per colour for SDR, when there is no untouched value to restore.
+const SDR_BPC: u64 = 8;
 /// Static metadata type 1, the only type HDMI defines.
 const STATIC_METADATA_TYPE_1: u8 = 0;
 
@@ -86,7 +88,9 @@ impl HdrProperties {
         let mut bt2020_rgb = None;
         let mut default_colorspace = None;
         let mut max_bpc = None;
-        let mut sdr_bpc = 8;
+        let mut sdr_bpc = SDR_BPC;
+        let mut current_colorspace = None;
+        let mut current_metadata = 0;
 
         let (handles, values) = props.as_props_and_values();
         for (handle, value) in handles.iter().copied().zip(values.iter().copied()) {
@@ -96,6 +100,7 @@ impl HdrProperties {
             match info.name().to_str() {
                 Ok("Colorspace") => {
                     colorspace = Some(handle);
+                    current_colorspace = Some(value);
                     if let property::ValueType::Enum(values) = info.value_type() {
                         let (raw, named) = values.values();
                         for (value, name) in raw.iter().zip(named.iter()) {
@@ -107,7 +112,10 @@ impl HdrProperties {
                         }
                     }
                 }
-                Ok("HDR_OUTPUT_METADATA") => metadata = Some(handle),
+                Ok("HDR_OUTPUT_METADATA") => {
+                    metadata = Some(handle);
+                    current_metadata = value;
+                }
                 Ok("max bpc") => {
                     max_bpc = Some(handle);
                     sdr_bpc = value;
@@ -116,15 +124,33 @@ impl HdrProperties {
             }
         }
 
-        Some(HdrProperties {
+        let default_colorspace = default_colorspace?;
+        // The connector's state outlives the compositor. A claim that was in effect
+        // when the previous one exited is still on the connector, so its `max bpc`
+        // is the claim's and not the one to restore, and the claim itself has to be
+        // taken down: nothing would release it, and `claimed` would say there is
+        // none.
+        let leaked = current_metadata != 0 || current_colorspace != Some(default_colorspace);
+        if leaked {
+            sdr_bpc = SDR_BPC;
+        }
+
+        let mut properties = HdrProperties {
             colorspace: colorspace?,
             metadata: metadata?,
             max_bpc,
             sdr_bpc,
             bt2020_rgb: bt2020_rgb?,
-            default_colorspace: default_colorspace?,
+            default_colorspace,
             blob: None,
-        })
+        };
+        if leaked {
+            match properties.set(drm, connector, false) {
+                Ok(()) => info!("released an HDR claim left on the connector"),
+                Err(err) => warn!(?err, "failed to release an HDR claim left on the connector"),
+            }
+        }
+        Some(properties)
     }
 
     /// Tell the sink to expect PQ in BT.2020, or to go back to what it was.

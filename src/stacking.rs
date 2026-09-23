@@ -38,7 +38,7 @@ const OVERLAY_TITLE: &str = "tvbox-overlay";
 /// Resolved once. This is asked for every window of every frame, and reading the
 /// environment there would allocate a string per window per frame - and let a
 /// mid-run `set_var` disagree with the stacking that is already on screen.
-fn shell_app_id() -> &'static str {
+pub(crate) fn shell_app_id() -> &'static str {
     static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     ID.get_or_init(|| {
         std::env::var("TVBOX_SHELL_APP_ID").unwrap_or_else(|_| SHELL_APP_ID.to_owned())
@@ -80,10 +80,10 @@ enum Rank {
 /// keep in front: a film covered the UI that is supposed to be over it, and took the
 /// remote with it.
 ///
-/// This is not a security boundary - a client that maps with the shell's app id from
-/// the start still joins that group, and on this box every Wayland client is
-/// something the shell or the user installed. It removes the mid-flight change,
-/// which is the part that is neither useful nor expected.
+/// This is not the security boundary - a client that maps with the shell's app id
+/// from the start still joins that group. What keeps a sandboxed app out of it is
+/// the trust check in [`rank_of`] and [`place_keys_for`]; this removes the
+/// mid-flight change, which is the part that is neither useful nor expected.
 pub fn app_id(window: &Window) -> Option<String> {
     let surface = window.wl_surface()?;
     with_states(&surface, |states| {
@@ -151,6 +151,7 @@ pub fn place_key(window: &Window) -> Vec<crate::state::PlaceKey> {
         app_id(window).as_deref(),
         window_title(window).as_deref(),
         shell_app_id(),
+        trusted(window),
     )
 }
 
@@ -159,10 +160,11 @@ fn place_keys_for(
     app_id: Option<&str>,
     title: Option<&str>,
     shell: &str,
+    trusted: bool,
 ) -> Vec<crate::state::PlaceKey> {
     use crate::state::PlaceKey;
     let mut keys = Vec::new();
-    if app_id == Some(shell) {
+    if trusted && app_id == Some(shell) {
         if let Some(title) = title {
             keys.push(PlaceKey::Title(title.to_owned()));
         }
@@ -181,6 +183,20 @@ pub fn stacked(space: &Space<Window>) -> Vec<Window> {
     }))
 }
 
+/// Whether the window's client is one of the box's own programs rather than a
+/// sandboxed app.
+fn trusted(window: &Window) -> bool {
+    window
+        .wl_surface()
+        .map(|surface| crate::state::surface_trusted(&surface))
+        .unwrap_or(false)
+}
+
+/// Is this one of the shell's windows?
+pub fn is_shell(window: &Window) -> bool {
+    rank(window) != Rank::Other
+}
+
 /// Which group a window belongs to.
 fn rank(window: &Window) -> Rank {
     rank_of(
@@ -188,12 +204,22 @@ fn rank(window: &Window) -> Rank {
         window_title(window).as_deref(),
         shell_app_id(),
         overlay_title(),
+        trusted(window),
     )
 }
 
 /// The rule itself, away from Wayland: who is allowed in front of what.
-fn rank_of(app_id: Option<&str>, title: Option<&str>, shell: &str, overlay: &str) -> Rank {
-    if app_id != Some(shell) {
+///
+/// A sandboxed client is never the shell, whatever it calls itself: the app id is a
+/// string, and the sandbox is the one thing the compositor can tell apart for sure.
+fn rank_of(
+    app_id: Option<&str>,
+    title: Option<&str>,
+    shell: &str,
+    overlay: &str,
+    trusted: bool,
+) -> Rank {
+    if !trusted || app_id != Some(shell) {
         // Only the shell's own windows can be an overlay. A title is a string any
         // page can set, so without this a web app could name itself to the front.
         return Rank::Other;
@@ -311,10 +337,10 @@ mod tests {
         // behind it, and the note still has to be seen.
         let order = order(vec![
             ("shell", Rank::Shell),
-            ("plex", Rank::Other),
+            ("app", Rank::Other),
             ("note", Rank::Overlay),
         ]);
-        assert_eq!(order, vec!["plex", "shell", "note"]);
+        assert_eq!(order, vec!["app", "shell", "note"]);
     }
 
     #[test]
@@ -326,7 +352,8 @@ mod tests {
                 Some("tvbox-shell"),
                 Some("tvbox-overlay"),
                 "tvbox-shell",
-                "tvbox-overlay"
+                "tvbox-overlay",
+                true
             ),
             Rank::Overlay
         );
@@ -335,22 +362,48 @@ mod tests {
                 Some("mpv"),
                 Some("tvbox-overlay"),
                 "tvbox-shell",
-                "tvbox-overlay"
+                "tvbox-overlay",
+                true
             ),
             Rank::Other
         );
         assert_eq!(
             rank_of(
                 Some("tvbox-shell"),
-                Some("Plex"),
+                Some("an app"),
                 "tvbox-shell",
-                "tvbox-overlay"
+                "tvbox-overlay",
+                true
             ),
             Rank::Shell
         );
         assert_eq!(
-            rank_of(None, None, "tvbox-shell", "tvbox-overlay"),
+            rank_of(None, None, "tvbox-shell", "tvbox-overlay", true),
             Rank::Other
+        );
+    }
+
+    #[test]
+    fn a_sandboxed_client_is_never_the_shell() {
+        // The name is a string; the sandbox is not.
+        assert_eq!(
+            rank_of(
+                Some("tvbox-shell"),
+                Some("tvbox-overlay"),
+                "tvbox-shell",
+                "tvbox-overlay",
+                false
+            ),
+            Rank::Other
+        );
+        assert_eq!(
+            place_keys_for(
+                Some("tvbox-shell"),
+                Some("tvbox-overlay"),
+                "tvbox-shell",
+                false
+            ),
+            vec![crate::state::PlaceKey::AppId("tvbox-shell".into())]
         );
     }
 
@@ -404,7 +457,12 @@ mod tests {
         use crate::state::PlaceKey;
         // A title names ONE of the shell's windows, which is what the note needs.
         assert_eq!(
-            place_keys_for(Some("tvbox-shell"), Some("tvbox-overlay"), "tvbox-shell"),
+            place_keys_for(
+                Some("tvbox-shell"),
+                Some("tvbox-overlay"),
+                "tvbox-shell",
+                true
+            ),
             vec![
                 PlaceKey::Title("tvbox-overlay".into()),
                 PlaceKey::AppId("tvbox-shell".into()),
@@ -414,12 +472,12 @@ mod tests {
         // yourself puts you in the note's rectangle - and since a changed location
         // is what re-places a window, renaming moves you about at will.
         assert_eq!(
-            place_keys_for(Some("mpv"), Some("tvbox-overlay"), "tvbox-shell"),
+            place_keys_for(Some("mpv"), Some("tvbox-overlay"), "tvbox-shell", true),
             vec![PlaceKey::AppId("mpv".into())]
         );
         // A window that has not named its client is placed by nothing.
         assert_eq!(
-            place_keys_for(None, Some("tvbox-overlay"), "tvbox-shell"),
+            place_keys_for(None, Some("tvbox-overlay"), "tvbox-shell", true),
             vec![]
         );
     }
@@ -432,10 +490,10 @@ mod tests {
         assert_eq!(
             focusable(vec![
                 ("launcher", Rank::Shell, false),
-                ("plex", Rank::Other, true),
+                ("app", Rank::Other, true),
                 ("note", Rank::Overlay, true),
             ]),
-            Some("plex")
+            Some("app")
         );
     }
 

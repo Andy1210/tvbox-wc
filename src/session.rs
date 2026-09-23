@@ -21,25 +21,46 @@ use crate::state::Tvbox;
 pub struct Session {
     /// Also the process group id: the child leads its own group.
     pid: i32,
-    /// Set once the child has been reaped. After that the pid belongs to the
-    /// kernel again and may already name someone else's process group, so the
-    /// signal below must not go out.
-    reaped: Arc<AtomicBool>,
 }
 
+/// How long the session's processes get to exit on SIGTERM before they are killed.
+const GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+
 impl Session {
-    /// Ask the session and everything it started to end.
+    /// End the session and everything it started.
     ///
     /// The whole group, because the session is a shell script whose real work is
     /// its children - signalling only the script would leave the shell running on a
-    /// display that is about to disappear.
+    /// display that is about to disappear. The group is signalled even after the
+    /// script itself has exited and been reaped: the group outlives its leader, and
+    /// the kernel does not hand its id to anyone else while a member is alive, so
+    /// the signal can only reach what the session started.
+    ///
+    /// SIGTERM first, then SIGKILL for whatever is still there after [`GRACE`]. A
+    /// player blocked in a network read, or a program that ignores SIGTERM, would
+    /// otherwise outlive the display and meet the next session's copy of itself.
     pub fn stop(&self) {
-        if self.reaped.load(Ordering::SeqCst) {
+        stop_group(self.pid, GRACE);
+    }
+}
+
+/// Signal a process group to end, and kill it when it does not.
+fn stop_group(pgid: i32, grace: std::time::Duration) {
+    // Safety: kill(2) with a negative pid signals the process group; ESRCH (nothing
+    // left in it) is the answer when the session has already gone.
+    if unsafe { libc::kill(-pgid, libc::SIGTERM) } != 0 {
+        return;
+    }
+    let deadline = std::time::Instant::now() + grace;
+    while std::time::Instant::now() < deadline {
+        // Signal 0 only asks whether any member is left.
+        if unsafe { libc::kill(-pgid, 0) } != 0 {
             return;
         }
-        // Safety: kill(2) with a negative pid signals the process group.
-        unsafe { libc::kill(-self.pid, libc::SIGTERM) };
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
+    warn!(pgid, "the session did not exit on SIGTERM - killing it");
+    unsafe { libc::kill(-pgid, libc::SIGKILL) };
 }
 
 /// The session must not outlive the compositor, whatever ends it.
@@ -63,6 +84,7 @@ impl Drop for Session {
 pub fn spawn(
     loop_handle: &LoopHandle<'static, Tvbox>,
     command: Vec<String>,
+    environment: &[(&str, &std::ffi::OsStr)],
     running: Arc<AtomicBool>,
 ) -> Result<Session> {
     let (program, arguments) = command
@@ -70,6 +92,7 @@ pub fn spawn(
         .expect("parse rejects an empty command");
     let mut child = Command::new(program)
         .args(arguments)
+        .envs(environment.iter().copied())
         .process_group(0)
         .spawn()
         .with_context(|| format!("failed to start the session: {program}"))?;
@@ -80,8 +103,6 @@ pub fn spawn(
     // the session's first act is to connect to it. The channel is how the answer
     // gets back into the loop; a bare atomic would not wake it up.
     let (sender, receiver) = channel::channel::<i32>();
-    let reaped = Arc::new(AtomicBool::new(false));
-    let watcher_reaped = reaped.clone();
     std::thread::Builder::new()
         .name("session-wait".to_owned())
         .spawn(move || {
@@ -89,7 +110,6 @@ pub fn spawn(
                 Ok(status) => status.code().unwrap_or(-1),
                 Err(_) => -1,
             };
-            watcher_reaped.store(true, Ordering::SeqCst);
             let _ = sender.send(code);
         })
         .context("failed to start the session watcher")?;
@@ -103,5 +123,55 @@ pub fn spawn(
         })
         .map_err(|err| anyhow::anyhow!("failed to watch the session: {err}"))?;
 
-    Ok(Session { pid, reaped })
+    Ok(Session { pid })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn alive(pid: i32) -> bool {
+        unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    #[test]
+    fn a_child_is_stopped_after_its_leader_has_exited() {
+        // The leader exits at once and leaves a child behind in its group, which is
+        // the shape of a session script that crashed.
+        let mut leader = std::process::Command::new("sh")
+            .args(["-c", "sleep 30 >/dev/null & echo $!"])
+            .process_group(0)
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pgid = leader.id() as i32;
+        let mut out = String::new();
+        std::io::Read::read_to_string(leader.stdout.as_mut().unwrap(), &mut out).unwrap();
+        leader.wait().unwrap();
+        let orphan: i32 = out.trim().parse().unwrap();
+        assert!(alive(orphan));
+
+        stop_group(pgid, std::time::Duration::from_secs(2));
+        // The orphan is not our child, so nothing reaps it here; its init does.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while alive(orphan) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(!alive(orphan));
+    }
+
+    #[test]
+    fn a_process_that_ignores_sigterm_is_killed() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "trap '' TERM; while :; do sleep 0.05; done"])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        let started = std::time::Instant::now();
+        stop_group(child.id() as i32, std::time::Duration::from_millis(300));
+        let status = child.wait().unwrap();
+        assert!(started.elapsed() >= std::time::Duration::from_millis(300));
+        assert!(!status.success());
+    }
 }

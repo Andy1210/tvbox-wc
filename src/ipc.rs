@@ -15,8 +15,11 @@
 //! ```
 //!
 //! The socket is owned by the session user and lives in a directory only that user
-//! can reach, which is the same protection mpv's control socket has. Anything that
-//! could reach this socket can already reach the compositor's Wayland socket.
+//! can reach, which is the same protection mpv's control socket has, and a
+//! connection from any other uid is refused. A sandboxed app (Flatpak) gets a
+//! private runtime directory with only the Wayland socket in it, so it cannot reach
+//! this one at all; an unsandboxed program running as the session user can, just as
+//! it can reach every other socket that user owns.
 
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -190,6 +193,14 @@ struct Envelope {
 /// which is the compositor.
 const MAX_LINE: usize = 64 * 1024;
 
+/// How much one connection is read, and how many of its requests are answered, per
+/// turn of the event loop. The source is level-triggered, so whatever is left is
+/// picked up on the next turn - after the frames, the input and every other client
+/// have had theirs. Without a bound a peer that writes as fast as it can would keep
+/// the loop in this callback and freeze the picture and the remote.
+const MAX_READ_PER_TURN: usize = 256 * 1024;
+const MAX_REQUESTS_PER_TURN: usize = 64;
+
 /// Start listening, and return the path so it can be handed to children.
 pub fn listen(loop_handle: &LoopHandle<'static, Tvbox>, path: PathBuf) -> Result<PathBuf> {
     // A socket left behind by a compositor that did not shut down cleanly would
@@ -234,6 +245,15 @@ pub fn listen(loop_handle: &LoopHandle<'static, Tvbox>, path: PathBuf) -> Result
 }
 
 fn accept(stream: UnixStream) {
+    // The socket's mode already says this, but not when it landed in the /tmp
+    // fallback before the permission was set, and a peer's uid costs one call.
+    match peer_uid(&stream) {
+        Some(uid) if uid == unsafe { libc::geteuid() } => {}
+        uid => {
+            warn!(?uid, "refused a control connection from another user");
+            return;
+        }
+    }
     if let Err(err) = stream.set_nonblocking(true) {
         warn!(?err, "failed to configure a control connection");
         return;
@@ -243,6 +263,28 @@ fn accept(stream: UnixStream) {
     // Registering from inside the accept callback needs the loop handle, which the
     // state carries; do it from an idle callback so the borrow is clean.
     CONNECTIONS.with(|pending| pending.borrow_mut().push(stream));
+}
+
+/// The uid of the process at the other end of a unix socket.
+fn peer_uid(stream: &UnixStream) -> Option<libc::uid_t> {
+    use std::os::unix::io::AsRawFd as _;
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // Safety: SO_PEERCRED writes a ucred into a buffer of exactly that size.
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast(),
+            &mut len,
+        )
+    };
+    (result == 0).then_some(cred.uid)
 }
 
 thread_local! {
@@ -262,18 +304,19 @@ pub fn register_pending(state: &mut Tvbox) {
             Generic::new(stream, Interest::READ, Mode::Level),
             move |_, stream, state: &mut Tvbox| {
                 let mut chunk = [0u8; 4096];
-                loop {
+                let mut read = 0;
+                let mut closed = false;
+                // Only while there is room: the requests already in the buffer are
+                // answered first, so a peer cannot fill it faster than it is drained.
+                while read < MAX_READ_PER_TURN && buffer.len() <= MAX_LINE {
                     match (&**stream).read(&mut chunk) {
-                        Ok(0) => return Ok(PostAction::Remove),
+                        Ok(0) => {
+                            closed = true;
+                            break;
+                        }
                         Ok(n) => {
+                            read += n;
                             buffer.extend_from_slice(&chunk[..n]);
-                            if buffer.len() > MAX_LINE && !buffer.contains(&b'\n') {
-                                warn!(
-                                    bytes = buffer.len(),
-                                    "a control connection sent no newline - dropping it"
-                                );
-                                return Ok(PostAction::Remove);
-                            }
                         }
                         Err(err) if err.kind() == ErrorKind::WouldBlock => break,
                         Err(err) if err.kind() == ErrorKind::Interrupted => continue,
@@ -284,8 +327,13 @@ pub fn register_pending(state: &mut Tvbox) {
                     }
                 }
 
-                while let Some(end) = buffer.iter().position(|byte| *byte == b'\n') {
+                let mut answered = 0;
+                while answered < MAX_REQUESTS_PER_TURN {
+                    let Some(end) = buffer.iter().position(|byte| *byte == b'\n') else {
+                        break;
+                    };
                     let line: Vec<u8> = buffer.drain(..=end).collect();
+                    answered += 1;
                     let reply = handle_line(state, &line[..line.len() - 1]);
                     if let Err(err) = send(stream, &reply) {
                         warn!(?err, "failed to answer a control request");
@@ -293,6 +341,16 @@ pub fn register_pending(state: &mut Tvbox) {
                     }
                 }
 
+                if unterminated_too_long(&buffer) {
+                    warn!(
+                        bytes = buffer.len(),
+                        "a control connection sent an over-long line - dropping it"
+                    );
+                    return Ok(PostAction::Remove);
+                }
+                if closed && !buffer.contains(&b'\n') {
+                    return Ok(PostAction::Remove);
+                }
                 Ok(PostAction::Continue)
             },
         );
@@ -300,6 +358,18 @@ pub fn register_pending(state: &mut Tvbox) {
             warn!(?err, "failed to register a control connection");
         }
     }
+}
+
+/// Whether the part of the buffer after its last complete line is already longer
+/// than any request may be. Counted after the LAST newline: a peer that sends one
+/// short line and then an endless one must not get past the cap on the strength of
+/// the newline that is already in the buffer.
+fn unterminated_too_long(buffer: &[u8]) -> bool {
+    let start = buffer
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |at| at + 1);
+    buffer.len() - start > MAX_LINE
 }
 
 fn handle_line(state: &mut Tvbox, line: &[u8]) -> String {
@@ -406,6 +476,13 @@ fn dispatch(state: &mut Tvbox, request: Request) -> Result<serde_json::Value> {
             h,
         } => {
             let key = match (app_id, title) {
+                // Every window of the shell shares its app id, the launcher included,
+                // so a placement by it would move the whole UI - off screen, or into
+                // a corner - and nothing the shell does needs that. Its windows are
+                // placed one at a time, by title.
+                (Some(app_id), None) if app_id == crate::stacking::shell_app_id() => {
+                    anyhow::bail!("the shell's windows are placed by title, not by app id")
+                }
                 (Some(app_id), None) => crate::state::PlaceKey::AppId(app_id),
                 (None, Some(title)) => crate::state::PlaceKey::Title(title),
                 _ => anyhow::bail!(
@@ -481,4 +558,34 @@ fn send(mut stream: &UnixStream, reply: &str) -> std::io::Result<()> {
         ErrorKind::WouldBlock,
         "the client stopped reading",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_short_line_does_not_let_an_endless_one_through() {
+        let mut buffer = b"{}\n".to_vec();
+        buffer.extend(std::iter::repeat_n(b'x', MAX_LINE));
+        assert!(!unterminated_too_long(&buffer));
+        buffer.push(b'x');
+        assert!(unterminated_too_long(&buffer));
+    }
+
+    #[test]
+    fn complete_lines_do_not_count_against_the_cap() {
+        let mut buffer = Vec::new();
+        for _ in 0..=(MAX_LINE / 4) {
+            buffer.extend_from_slice(b"{}\n\n");
+        }
+        assert!(buffer.len() > MAX_LINE);
+        assert!(!unterminated_too_long(&buffer));
+    }
+
+    #[test]
+    fn the_peer_uid_is_ours_on_a_socketpair() {
+        let (a, _b) = UnixStream::pair().unwrap();
+        assert_eq!(peer_uid(&a), Some(unsafe { libc::geteuid() }));
+    }
 }
