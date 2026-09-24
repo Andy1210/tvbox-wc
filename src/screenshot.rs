@@ -101,12 +101,26 @@ fn write_png(path: &Path, width: i32, height: i32, pixels: &[u8]) -> Result<()> 
 fn open_target(path: &Path) -> Result<std::fs::File> {
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
     anyhow::ensure!(path.is_absolute(), "a screenshot path must be absolute");
+    // Refuse anything but a regular file before opening it: opening a FIFO for
+    // writing blocks until a reader appears, and a device node may act on the open
+    // itself. O_NONBLOCK covers the window between this check and the open.
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) => anyhow::ensure!(
+            metadata.file_type().is_file(),
+            "{} is not a regular file",
+            path.display()
+        ),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => {
+            return Err(err).with_context(|| format!("failed to inspect {}", path.display()))
+        }
+    }
     let file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(false)
         .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
         .open(path)
         .with_context(|| format!("failed to create {}", path.display()))?;
     let metadata = file
@@ -151,6 +165,17 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).unwrap();
         assert!(open_target(&link).is_err());
         assert_eq!(std::fs::read(&target).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn a_fifo_is_refused_without_blocking() {
+        let dir = scratch();
+        let fifo = dir.join("fifo.png");
+        let _ = std::fs::remove_file(&fifo);
+        let name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        // With no reader, a blocking open for writing would never return.
+        assert!(open_target(&fifo).is_err());
     }
 
     #[test]

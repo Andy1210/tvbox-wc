@@ -164,7 +164,12 @@ fn place_keys_for(
 ) -> Vec<crate::state::PlaceKey> {
     use crate::state::PlaceKey;
     let mut keys = Vec::new();
-    if trusted && app_id == Some(shell) {
+    if app_id == Some(shell) {
+        // A sandboxed client naming itself the shell gets none of the shell's
+        // placements, by title or by app id.
+        if !trusted {
+            return keys;
+        }
         if let Some(title) = title {
             keys.push(PlaceKey::Title(title.to_owned()));
         }
@@ -403,7 +408,7 @@ mod tests {
                 "tvbox-shell",
                 false
             ),
-            vec![crate::state::PlaceKey::AppId("tvbox-shell".into())]
+            vec![]
         );
     }
 

@@ -303,15 +303,16 @@ pub fn run(options: cli::Options) -> Result<()> {
         None => None,
     };
 
-    // SIGTERM and SIGINT end the loop the same way the quit combination does, so
-    // the session's Drop runs. Without this, systemd stopping the session leaves
-    // the shell and mpv behind.
+    // SIGTERM, SIGINT and SIGHUP end the loop the same way the quit combination
+    // does, so the session's Drop runs. SIGHUP is what a session manager sends when
+    // the terminal the session was started on goes away, and its default action
+    // would end the compositor without that cleanup.
     {
         let running = state.running.clone();
         event_loop
             .handle()
             .insert_source(
-                Signals::new(&[Signal::SIGTERM, Signal::SIGINT])
+                Signals::new(&[Signal::SIGTERM, Signal::SIGINT, Signal::SIGHUP])
                     .context("failed to watch for signals")?,
                 move |event, _, _state| {
                     info!(signal = ?event.signal(), "asked to stop");
@@ -340,7 +341,9 @@ pub fn run(options: cli::Options) -> Result<()> {
     // Not conditional on the loop's result: `session` is dropped here either way,
     // and its Drop stops the session. An error path that skipped this would leave
     // the shell running against a display that is gone.
-    drop(session);
+    if let Some(mut session) = session {
+        session.stop();
+    }
     result?;
 
     Ok(())

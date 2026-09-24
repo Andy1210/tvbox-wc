@@ -21,10 +21,12 @@
 //! this one at all; an unsandboxed program running as the session user can, just as
 //! it can reach every other socket that user owns.
 
+use std::cell::RefCell;
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
@@ -291,6 +293,78 @@ thread_local! {
     static CONNECTIONS: std::cell::RefCell<Vec<UnixStream>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// One control connection: what has been read and not answered yet, and a handle
+/// to write the answers with. Shared between the socket's source and the idle
+/// callback that answers what one turn left over.
+struct Connection {
+    buffer: Vec<u8>,
+    writer: UnixStream,
+    /// A write failed; the source removes itself the next time it runs.
+    dead: bool,
+    /// An idle callback is already queued to answer the rest.
+    scheduled: bool,
+}
+
+/// Answer up to `max` complete lines from the front of `buffer`, and say whether
+/// complete lines are still waiting. `answer` returns false when the reply could
+/// not be sent, which stops the drain.
+fn answer_lines(
+    buffer: &mut Vec<u8>,
+    max: usize,
+    mut answer: impl FnMut(&[u8]) -> bool,
+) -> Result<bool, ()> {
+    let mut answered = 0;
+    while answered < max {
+        let Some(end) = buffer.iter().position(|byte| *byte == b'\n') else {
+            return Ok(false);
+        };
+        let line: Vec<u8> = buffer.drain(..=end).collect();
+        answered += 1;
+        if !answer(&line[..line.len() - 1]) {
+            return Err(());
+        }
+    }
+    Ok(buffer.contains(&b'\n'))
+}
+
+/// Answer one turn's worth of a connection's requests, and queue an idle callback
+/// for the rest. The socket is level-triggered on READ, so lines that are already
+/// buffered would otherwise wait for the peer to send something else.
+fn drain(state: &mut Tvbox, connection: &Rc<RefCell<Connection>>) {
+    let more = {
+        let mut conn = connection.borrow_mut();
+        let Connection { buffer, writer, .. } = &mut *conn;
+        let result = answer_lines(buffer, MAX_REQUESTS_PER_TURN, |line| {
+            let reply = handle_line(state, line);
+            match send(writer, &reply) {
+                Ok(()) => true,
+                Err(err) => {
+                    warn!(?err, "failed to answer a control request");
+                    false
+                }
+            }
+        });
+        match result {
+            Ok(more) => more,
+            Err(()) => {
+                conn.dead = true;
+                false
+            }
+        }
+    };
+    let mut conn = connection.borrow_mut();
+    if more && !conn.scheduled {
+        conn.scheduled = true;
+        let connection = connection.clone();
+        state.loop_handle.insert_idle(move |state| {
+            connection.borrow_mut().scheduled = false;
+            if !connection.borrow().dead {
+                drain(state, &connection);
+            }
+        });
+    }
+}
+
 /// Register any connection accepted since the last call.
 ///
 /// Called from the event loop's per-iteration callback: accepting and registering
@@ -299,56 +373,71 @@ pub fn register_pending(state: &mut Tvbox) {
     let pending: Vec<UnixStream> =
         CONNECTIONS.with(|pending| pending.borrow_mut().drain(..).collect());
     for stream in pending {
-        let mut buffer = Vec::new();
+        let writer = match stream.try_clone() {
+            Ok(writer) => writer,
+            Err(err) => {
+                warn!(?err, "failed to register a control connection");
+                continue;
+            }
+        };
+        let connection = Rc::new(RefCell::new(Connection {
+            buffer: Vec::new(),
+            writer,
+            dead: false,
+            scheduled: false,
+        }));
         let inserted = state.loop_handle.insert_source(
             Generic::new(stream, Interest::READ, Mode::Level),
             move |_, stream, state: &mut Tvbox| {
+                if connection.borrow().dead {
+                    return Ok(PostAction::Remove);
+                }
                 let mut chunk = [0u8; 4096];
                 let mut read = 0;
                 let mut closed = false;
-                // Only while there is room: the requests already in the buffer are
-                // answered first, so a peer cannot fill it faster than it is drained.
-                while read < MAX_READ_PER_TURN && buffer.len() <= MAX_LINE {
-                    match (&**stream).read(&mut chunk) {
-                        Ok(0) => {
-                            closed = true;
-                            break;
-                        }
-                        Ok(n) => {
-                            read += n;
-                            buffer.extend_from_slice(&chunk[..n]);
-                        }
-                        Err(err) if err.kind() == ErrorKind::WouldBlock => break,
-                        Err(err) if err.kind() == ErrorKind::Interrupted => continue,
-                        Err(err) => {
-                            warn!(?err, "control connection failed");
-                            return Ok(PostAction::Remove);
+                {
+                    let mut conn = connection.borrow_mut();
+                    // Only while there is room: the requests already in the buffer
+                    // are answered first, so a peer cannot fill it faster than it is
+                    // drained.
+                    while read < MAX_READ_PER_TURN && conn.buffer.len() <= MAX_LINE {
+                        match (&**stream).read(&mut chunk) {
+                            Ok(0) => {
+                                closed = true;
+                                break;
+                            }
+                            Ok(n) => {
+                                read += n;
+                                conn.buffer.extend_from_slice(&chunk[..n]);
+                            }
+                            Err(err) if err.kind() == ErrorKind::WouldBlock => break,
+                            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+                            Err(err) => {
+                                warn!(?err, "control connection failed");
+                                return Ok(PostAction::Remove);
+                            }
                         }
                     }
                 }
 
-                let mut answered = 0;
-                while answered < MAX_REQUESTS_PER_TURN {
-                    let Some(end) = buffer.iter().position(|byte| *byte == b'\n') else {
-                        break;
-                    };
-                    let line: Vec<u8> = buffer.drain(..=end).collect();
-                    answered += 1;
-                    let reply = handle_line(state, &line[..line.len() - 1]);
-                    if let Err(err) = send(stream, &reply) {
-                        warn!(?err, "failed to answer a control request");
-                        return Ok(PostAction::Remove);
-                    }
+                // Lines an idle callback is about to answer are left to it, so the
+                // two cannot answer out of order.
+                if !connection.borrow().scheduled {
+                    drain(state, &connection);
                 }
 
-                if unterminated_too_long(&buffer) {
+                let conn = connection.borrow();
+                if conn.dead {
+                    return Ok(PostAction::Remove);
+                }
+                if unterminated_too_long(&conn.buffer) {
                     warn!(
-                        bytes = buffer.len(),
+                        bytes = conn.buffer.len(),
                         "a control connection sent an over-long line - dropping it"
                     );
                     return Ok(PostAction::Remove);
                 }
-                if closed && !buffer.contains(&b'\n') {
+                if closed && !conn.buffer.contains(&b'\n') {
                     return Ok(PostAction::Remove);
                 }
                 Ok(PostAction::Continue)
@@ -563,6 +652,48 @@ fn send(mut stream: &UnixStream, reply: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pipelined_requests_past_the_cap_are_left_for_the_next_turn() {
+        let mut buffer: Vec<u8> = (0..100)
+            .flat_map(|i| format!("{i}\n").into_bytes())
+            .collect();
+        let mut seen = Vec::new();
+        let more = answer_lines(&mut buffer, 64, |line| {
+            seen.push(String::from_utf8(line.to_vec()).unwrap());
+            true
+        });
+        assert_eq!(more, Ok(true));
+        assert_eq!(seen.len(), 64);
+        let more = answer_lines(&mut buffer, 64, |line| {
+            seen.push(String::from_utf8(line.to_vec()).unwrap());
+            true
+        });
+        assert_eq!(more, Ok(false));
+        assert_eq!(seen.len(), 100);
+        assert_eq!(seen[99], "99");
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn a_partial_line_is_kept_and_does_not_count_as_waiting() {
+        let mut buffer = b"a\nb".to_vec();
+        let more = answer_lines(&mut buffer, 64, |_| true);
+        assert_eq!(more, Ok(false));
+        assert_eq!(buffer, b"b");
+    }
+
+    #[test]
+    fn a_failed_answer_stops_the_drain() {
+        let mut buffer = b"a\nb\n".to_vec();
+        let mut calls = 0;
+        let result = answer_lines(&mut buffer, 64, |_| {
+            calls += 1;
+            false
+        });
+        assert_eq!(result, Err(()));
+        assert_eq!(calls, 1);
+    }
 
     #[test]
     fn a_short_line_does_not_let_an_endless_one_through() {
