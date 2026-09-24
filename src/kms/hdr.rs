@@ -76,6 +76,9 @@ pub struct HdrProperties {
     default_colorspace: u64,
     /// The blob currently attached, so it can be freed on release.
     blob: Option<u64>,
+    /// A claim was still on the connector when these were read, left there by a
+    /// compositor that exited without releasing it.
+    found_leftover: bool,
 }
 
 impl HdrProperties {
@@ -143,6 +146,7 @@ impl HdrProperties {
             bt2020_rgb: bt2020_rgb?,
             default_colorspace,
             blob: None,
+            found_leftover: leaked,
         };
         if leaked {
             match properties.set(drm, connector, false) {
@@ -231,6 +235,11 @@ impl HdrProperties {
                 Err(err)
             }
         }
+    }
+
+    /// Whether a claim was left on the connector by a previous run.
+    pub fn found_leftover(&self) -> bool {
+        self.found_leftover
     }
 
     /// Whether a claim is in effect.

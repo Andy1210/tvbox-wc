@@ -193,7 +193,7 @@ struct Envelope {
 /// string to type - and a peer that never sends a newline would otherwise grow this
 /// process at socket speed until the box's OOM killer picks the biggest thing on it,
 /// which is the compositor.
-const MAX_LINE: usize = 64 * 1024;
+pub(crate) const MAX_LINE: usize = 64 * 1024;
 
 /// How much one connection is read, and how many of its requests are answered, per
 /// turn of the event loop. The source is level-triggered, so whatever is left is
@@ -315,12 +315,11 @@ fn answer_lines(
 ) -> Result<bool, ()> {
     let mut answered = 0;
     while answered < max {
-        let Some(end) = buffer.iter().position(|byte| *byte == b'\n') else {
+        let Some(line) = next_line(buffer) else {
             return Ok(false);
         };
-        let line: Vec<u8> = buffer.drain(..=end).collect();
         answered += 1;
-        if !answer(&line[..line.len() - 1]) {
+        if !answer(&line) {
             return Err(());
         }
     }
@@ -453,12 +452,23 @@ pub fn register_pending(state: &mut Tvbox) {
 /// than any request may be. Counted after the LAST newline: a peer that sends one
 /// short line and then an endless one must not get past the cap on the strength of
 /// the newline that is already in the buffer.
-fn unterminated_too_long(buffer: &[u8]) -> bool {
+pub(crate) fn unterminated_too_long(buffer: &[u8]) -> bool {
     let start = buffer
         .iter()
         .rposition(|byte| *byte == b'\n')
         .map_or(0, |at| at + 1);
     buffer.len() - start > MAX_LINE
+}
+
+/// A line read off the socket, decoded as far as it can be without the compositor.
+#[derive(Debug)]
+pub(crate) enum Parsed {
+    /// Nothing but whitespace: answered with nothing.
+    Blank,
+    /// Not a request. Carries the reply.
+    Invalid(String),
+    /// A request, and the id to answer it with.
+    Request(Option<u64>, Request),
 }
 
 /// The error answer for a line that did not decode as a request. The id is read
@@ -476,18 +486,28 @@ fn undecodable_reply(line: &[u8], error: &str) -> String {
     })
 }
 
-fn handle_line(state: &mut Tvbox, line: &[u8]) -> String {
+/// Decode one line, without a newline.
+pub(crate) fn parse_line(line: &[u8]) -> Parsed {
     if line.iter().all(u8::is_ascii_whitespace) {
-        return String::new();
+        return Parsed::Blank;
     }
+    match serde_json::from_slice::<Envelope>(line) {
+        Ok(envelope) => Parsed::Request(envelope.id, envelope.request),
+        Err(err) => Parsed::Invalid(undecodable_reply(line, &err.to_string())),
+    }
+}
 
-    let envelope: Envelope = match serde_json::from_slice(line) {
-        Ok(envelope) => envelope,
-        Err(err) => return undecodable_reply(line, &err.to_string()),
-    };
+/// Take the next complete line off the front of the buffer, without its newline.
+pub(crate) fn next_line(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
+    let end = buffer.iter().position(|byte| *byte == b'\n')?;
+    let mut line: Vec<u8> = buffer.drain(..=end).collect();
+    line.pop();
+    Some(line)
+}
 
-    let id = envelope.id;
-    match dispatch(state, envelope.request) {
+/// The encoded reply to a request that has been answered.
+pub(crate) fn reply(id: Option<u64>, result: Result<serde_json::Value>) -> String {
+    match result {
         Ok(value) => encode(&Response {
             id,
             ok: Some(value),
@@ -499,6 +519,49 @@ fn handle_line(state: &mut Tvbox, line: &[u8]) -> String {
             error: Some(&err.to_string()),
         }),
     }
+}
+
+fn handle_line(state: &mut Tvbox, line: &[u8]) -> String {
+    match parse_line(line) {
+        Parsed::Blank => String::new(),
+        Parsed::Invalid(reply) => reply,
+        Parsed::Request(id, request) => reply(id, dispatch(state, request)),
+    }
+}
+
+/// What a `place_window` request names, and where it goes. `None` for the
+/// rectangle puts the windows back on the whole output.
+pub(crate) fn place_target(
+    app_id: Option<String>,
+    title: Option<String>,
+    x: Option<i32>,
+    y: Option<i32>,
+    w: Option<i32>,
+    h: Option<i32>,
+) -> Result<(
+    crate::state::PlaceKey,
+    Option<smithay::utils::Rectangle<i32, smithay::utils::Logical>>,
+)> {
+    let key = match (app_id, title) {
+        // Every window of the shell shares its app id, the launcher included,
+        // so a placement by it would move the whole UI - off screen, or into
+        // a corner - and nothing the shell does needs that. Its windows are
+        // placed one at a time, by title.
+        (Some(app_id), None) if app_id == crate::stacking::shell_app_id() => {
+            anyhow::bail!("the shell's windows are placed by title, not by app id")
+        }
+        (Some(app_id), None) => crate::state::PlaceKey::AppId(app_id),
+        (None, Some(title)) => crate::state::PlaceKey::Title(title),
+        _ => anyhow::bail!("name the windows by app_id or by title, not both and not neither"),
+    };
+    let rect = match (x, y, w, h) {
+        (Some(x), Some(y), Some(w), Some(h)) if w > 0 && h > 0 => {
+            Some(smithay::utils::Rectangle::new((x, y).into(), (w, h).into()))
+        }
+        (None, None, None, None) => None,
+        _ => anyhow::bail!("a rectangle needs x, y, w and h, and a positive size"),
+    };
+    Ok((key, rect))
 }
 
 fn dispatch(state: &mut Tvbox, request: Request) -> Result<serde_json::Value> {
@@ -563,6 +626,7 @@ fn dispatch(state: &mut Tvbox, request: Request) -> Result<serde_json::Value> {
                 // only safe once `type_text` replaces rather than appends. Absent on
                 // every build before this one, which is the right answer for them.
                 "version": env!("CARGO_PKG_VERSION"),
+                "health": health(state),
             }))
         }
         Request::PlaceWindow {
@@ -573,27 +637,7 @@ fn dispatch(state: &mut Tvbox, request: Request) -> Result<serde_json::Value> {
             w,
             h,
         } => {
-            let key = match (app_id, title) {
-                // Every window of the shell shares its app id, the launcher included,
-                // so a placement by it would move the whole UI - off screen, or into
-                // a corner - and nothing the shell does needs that. Its windows are
-                // placed one at a time, by title.
-                (Some(app_id), None) if app_id == crate::stacking::shell_app_id() => {
-                    anyhow::bail!("the shell's windows are placed by title, not by app id")
-                }
-                (Some(app_id), None) => crate::state::PlaceKey::AppId(app_id),
-                (None, Some(title)) => crate::state::PlaceKey::Title(title),
-                _ => anyhow::bail!(
-                    "name the windows by app_id or by title, not both and not neither"
-                ),
-            };
-            let rect = match (x, y, w, h) {
-                (Some(x), Some(y), Some(w), Some(h)) if w > 0 && h > 0 => {
-                    Some(smithay::utils::Rectangle::new((x, y).into(), (w, h).into()))
-                }
-                (None, None, None, None) => None,
-                _ => anyhow::bail!("a rectangle needs x, y, w and h, and a positive size"),
-            };
+            let (key, rect) = place_target(app_id, title, x, y, w, h)?;
             state.set_placement(key, rect);
             Ok(serde_json::Value::Null)
         }
@@ -614,6 +658,32 @@ fn dispatch(state: &mut Tvbox, request: Request) -> Result<serde_json::Value> {
             Ok(serde_json::Value::Null)
         }
     }
+}
+
+/// The `health` object of `get_state`: counters since start, the last frame's
+/// plane decisions, the HDR claim and the connected clients. Additive, so a caller
+/// that does not know it ignores it.
+fn health(state: &Tvbox) -> serde_json::Value {
+    let (hdr_supported, hdr_on) = state.tty.hdr_state();
+    let trusted = state.clients.values().filter(|trusted| **trusted).count();
+    serde_json::json!({
+        "display": state.tty.health,
+        "hdr": {
+            "supported": hdr_supported,
+            "on": hdr_on,
+            // A claim is made over this socket and released when the shell's last
+            // Wayland connection closes, so "held for the shell" is the only owner
+            // there can be; this says whether that owner is still here.
+            "shell_connected": !state.shell_clients.is_empty(),
+            "found_leftover_at_start": state.tty.hdr_found_leftover(),
+        },
+        "clients": {
+            "connected": state.clients.len(),
+            "trusted": trusted,
+            "sandboxed": state.clients.len() - trusted,
+            "shell": state.shell_clients.len(),
+        },
+    })
 }
 
 fn encode(response: &Response<'_>) -> String {

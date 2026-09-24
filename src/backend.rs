@@ -106,6 +106,9 @@ pub struct Tty {
     pub device: Option<Device>,
     /// The DRM event source, handed to the event loop once after opening.
     pub notifier: Option<smithay::backend::drm::DrmDeviceNotifier>,
+    /// Counters and the last frame's plane decisions, for `get_state`. Kept here
+    /// rather than on the output so a reconnect does not reset them.
+    pub health: crate::health::Health,
 }
 
 impl Tty {
@@ -115,6 +118,7 @@ impl Tty {
             session,
             device: None,
             notifier: None,
+            health: Default::default(),
         }
     }
 
@@ -363,7 +367,16 @@ impl Tty {
             .hdr
             .as_mut()
             .ok_or_else(|| anyhow!("this connector has no HDR properties"))?;
-        hdr.set(device.drm.device_fd(), surface.connector, on)?;
+        let result = hdr.set(device.drm.device_fd(), surface.connector, on);
+        match &result {
+            Ok(()) if on => self.health.hdr_claims += 1,
+            Ok(()) => self.health.hdr_releases += 1,
+            Err(err) => {
+                self.health.hdr_failures += 1;
+                self.health.note_error(err);
+            }
+        }
+        result?;
         info!(output = name, on, "HDR claim");
         Ok(())
     }
@@ -380,9 +393,25 @@ impl Tty {
             return;
         };
         match hdr.set(device.drm.device_fd(), surface.connector, false) {
-            Ok(()) => info!("released the HDR claim"),
-            Err(err) => warn!(?err, "failed to release the HDR claim"),
+            Ok(()) => {
+                self.health.hdr_releases += 1;
+                info!("released the HDR claim");
+            }
+            Err(err) => {
+                self.health.hdr_failures += 1;
+                self.health.note_error(&err);
+                warn!(?err, "failed to release the HDR claim");
+            }
         }
+    }
+
+    /// Whether a claim was found left on the connector when the output came up.
+    pub fn hdr_found_leftover(&self) -> bool {
+        self.device
+            .as_ref()
+            .and_then(|device| device.surface.as_ref())
+            .and_then(|surface| surface.hdr.as_ref())
+            .is_some_and(|hdr| hdr.found_leftover())
     }
 
     /// Whether the output has a colour space claimed.
@@ -791,6 +820,21 @@ pub fn render(state: &mut crate::state::Tvbox) {
             // What the plane assignment actually decided, per element. This is the
             // only honest answer to "why is this being composited"; the plane count
             // cannot tell composition from scan-out.
+            if !result.is_empty {
+                state.tty.health.last_frame = Some(crate::health::FrameSummary::tally(
+                    result
+                        .states
+                        .states
+                        .values()
+                        .map(|element| element.presentation_state),
+                    matches!(
+                        result.primary_element,
+                        smithay::backend::drm::compositor::PrimaryPlaneElement::Element(_)
+                    ),
+                    result.overlay_elements.len(),
+                    result.cursor_element.is_some(),
+                ));
+            }
             if tracing::enabled!(tracing::Level::DEBUG) {
                 let decisions: Vec<_> = result
                     .states
@@ -804,8 +848,11 @@ pub fn render(state: &mut crate::state::Tvbox) {
                 surface.redraw_needed = false;
             } else if let Err(err) = surface.compositor.queue_frame(()) {
                 warn!(?err, "failed to queue a frame");
+                state.tty.health.queue_failures += 1;
+                state.tty.health.note_error(&err);
                 retry = true;
             } else {
+                state.tty.health.frames_queued += 1;
                 surface.frame_pending = true;
                 surface.redraw_needed = false;
                 surface.frame_serial += 1;
@@ -814,6 +861,8 @@ pub fn render(state: &mut crate::state::Tvbox) {
         }
         Err(err) => {
             warn!(?err, "failed to render a frame");
+            state.tty.health.render_failures += 1;
+            state.tty.health.note_error(&err);
             retry = true;
         }
     }
@@ -866,6 +915,7 @@ pub fn render(state: &mut crate::state::Tvbox) {
             if let Some(surface) = stuck {
                 warn!("a page flip never completed - carrying on without it");
                 surface.abandon_pending_frame();
+                state.tty.health.flip_watchdog_fired += 1;
                 state.queue_redraw();
             }
             smithay::reexports::calloop::timer::TimeoutAction::Drop

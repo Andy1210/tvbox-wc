@@ -11,12 +11,16 @@
 #![warn(missing_docs)]
 
 pub mod cli;
+#[doc(hidden)]
+pub mod fuzz;
 pub mod kms;
 
 mod backend;
 mod cursor;
+mod health;
 mod input;
 mod ipc;
+mod recovery;
 mod render;
 mod screenshot;
 mod session;
@@ -144,6 +148,7 @@ pub fn run(options: cli::Options) -> Result<()> {
         ),
         client_disconnects,
         shell_clients: Default::default(),
+        clients: Default::default(),
         dmabuf_state: DmabufState::new(),
         dmabuf_global: None,
         seat,
@@ -257,8 +262,11 @@ pub fn run(options: cli::Options) -> Result<()> {
         .handle()
         .insert_source(socket, move |stream, _, state| {
             let data = state.client_state(None);
-            if let Err(err) = state.display_handle.insert_client(stream, Arc::new(data)) {
-                warn!(?err, "failed to accept a client");
+            match state.display_handle.insert_client(stream, Arc::new(data)) {
+                Ok(client) => {
+                    state.clients.insert(client.id(), true);
+                }
+                Err(err) => warn!(?err, "failed to accept a client"),
             }
         })
         .map_err(|err| anyhow::anyhow!("failed to insert the socket source: {err}"))?;

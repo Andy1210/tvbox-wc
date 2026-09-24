@@ -186,6 +186,9 @@ pub struct Tvbox {
     /// The clients that have presented the shell's app id. When the last of them is
     /// gone, so is the shell, and what it told the compositor goes with it.
     pub shell_clients: std::collections::HashSet<ClientId>,
+    /// Every connected client, and whether it is trusted. For `get_state` only:
+    /// the trust decisions themselves read the client's own data.
+    pub clients: std::collections::HashMap<ClientId, bool>,
 }
 
 /// What a placement is keyed by.
@@ -230,6 +233,7 @@ impl Tvbox {
     /// for a film nobody is playing any more. A respawned shell starts from nothing
     /// and says so again; until it does, the defaults are the right answer.
     pub fn on_client_disconnected(&mut self, client: ClientId) {
+        self.clients.remove(&client);
         if !self.shell_clients.remove(&client) || !self.shell_clients.is_empty() {
             return;
         }
@@ -1004,8 +1008,11 @@ impl SecurityContextHandler for Tvbox {
             .loop_handle
             .insert_source(source, move |stream, _, state| {
                 let data = state.client_state(Some(context.clone()));
-                if let Err(err) = state.display_handle.insert_client(stream, Arc::new(data)) {
-                    warn!(?err, "failed to accept a sandboxed client");
+                match state.display_handle.insert_client(stream, Arc::new(data)) {
+                    Ok(client) => {
+                        state.clients.insert(client.id(), false);
+                    }
+                    Err(err) => warn!(?err, "failed to accept a sandboxed client"),
                 }
             });
         if let Err(err) = inserted {

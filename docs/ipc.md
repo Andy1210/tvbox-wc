@@ -90,7 +90,19 @@ reads.
   "windows": [
     {"app_id": "mpv", "title": "a film", "mapped": true, "keyboard": false},
     {"app_id": "tvbox-shell", "title": "tvbox", "mapped": true, "keyboard": true}
-  ]
+  ],
+  "health": {
+    "display": {
+      "frames_queued": 18234, "render_failures": 0, "queue_failures": 0,
+      "flip_watchdog_fired": 0, "hdr_claims": 1, "hdr_releases": 0, "hdr_failures": 0,
+      "last_error": null,
+      "last_frame": {"elements": 2, "scanned_out": 2, "composited": 0, "skipped": 0,
+                     "primary": "element", "overlays": 1, "cursor_plane": false}
+    },
+    "hdr": {"supported": true, "on": true, "shell_connected": true,
+            "found_leftover_at_start": false},
+    "clients": {"connected": 3, "trusted": 2, "sandboxed": 1, "shell": 1}
+  }
 }}
 ```
 
@@ -109,6 +121,28 @@ answers the remote is a film that is in front of the UI, whatever the screen loo
 like. `mapped` says whether a window has drawn anything yet; a toplevel is listed
 from the moment it appears, which is before its first buffer. Builds before 0.1.11
 do not send that field, the same way builds before 0.1.10 do not send `version`.
+
+`health` says what the display path has been doing, so "is the film scanned out
+or composited" and "has the output been stalling" can be answered without debug
+logs. Builds before 0.1.12 do not send it.
+
+- `display` holds counters since the compositor started and a summary of the last
+  frame that put something new on screen. In `last_frame`, `scanned_out` counts
+  elements that went to a plane untouched and `composited` those the GPU drew into
+  the composition buffer; `primary` is `element` when a client buffer is on the
+  primary plane directly and `swapchain` when the plane shows the composition
+  buffer. A film playing without a GPU pass reads `"primary": "element"` with
+  `composited` at 0. `flip_watchdog_fired` counts page flips that never reported
+  completion and were given up on; anything above zero means the display stalled
+  at least once. `last_error` is the most recent render, queue or HDR failure,
+  shortened.
+- `hdr` repeats the claim state from `get_outputs`, plus whether the shell that made
+  the claim is still connected (a claim is released when it goes) and whether a
+  claim left by a previous run was found on the connector at start.
+- `clients` counts connected Wayland clients. `sandboxed` are those that came in
+  through a security context and are held away from the layer shell, the overlay
+  slot and title placement; `shell` are the clients that presented the shell's app
+  id.
 
 Two things separate "in front" from "holds the keyboard", and both can be read off
 the list above.
