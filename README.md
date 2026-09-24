@@ -96,6 +96,24 @@ command = "tvbox-wc -- /usr/local/bin/tvbox-session"
 Everything after `--` is started once the Wayland socket is listening, and the
 compositor stops when it exits.
 
+### Holding Home
+
+A remote key held past a threshold runs a command, so a session whose UI has
+crashed, frozen or lost its focus can still be brought back from the sofa. The key
+is delivered as usual; only the hold adds anything, and a second key going down
+during it cancels it. Defaults: Home (evdev 172) held 3 s runs
+`~/.tvbox/recover.sh reload`, held 10 s runs `~/.tvbox/recover.sh restart`. A
+command that does not exist is skipped.
+
+| Variable                    | Default                    | Meaning                                    |
+| --------------------------- | -------------------------- | ------------------------------------------ |
+| `TVBOX_WC_RECOVERY_CMD`     | `$HOME/.tvbox/recover.sh`  | The command; empty switches the hold off.  |
+| `TVBOX_WC_RECOVERY_KEYS`    | `172`                      | Comma-separated evdev key codes to watch.  |
+| `TVBOX_WC_RECOVERY_HOLD_MS` | `3000,10000`               | Thresholds for `reload` and `restart`.     |
+
+It needs a remote that reports how long a key is down (Bluetooth, USB, IR
+receivers). A CEC remote whose Home is synthesised as a tap cannot hold it.
+
 ## Building
 
 Needs a recent stable Rust (1.85+) and the Smithay build dependencies:
@@ -107,6 +125,15 @@ cargo build --release
 ```
 
 On a 4 GB Pi 5, build with `-j3`.
+
+The control socket's decoding has a fuzz target in `fuzz/`, which is its own
+workspace and never part of the normal build. It needs nightly and cargo-fuzz:
+
+```sh
+cargo +nightly fuzz run control_line
+```
+
+`cargo test` runs a deterministic pass of the same checks over mutated requests.
 
 ## Tools
 

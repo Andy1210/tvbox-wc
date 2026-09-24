@@ -153,6 +153,9 @@ fn keyboard(state: &mut Tvbox, event: <LibinputInputBackend as InputBackend>::Ke
         );
     }
     let key_state = event.state();
+    // Before any client sees it, and whatever it is remapped to: a held Home key is
+    // the way back when the UI cannot help (recovery.rs). Never consumes the key.
+    crate::recovery::on_key(state, u32::from(original).saturating_sub(8), key_state);
     let running = state.running.clone();
 
     keyboard.input::<(), _>(

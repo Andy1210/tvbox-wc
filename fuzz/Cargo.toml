@@ -1,0 +1,29 @@
+[package]
+name = "tvbox-wc-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.tvbox-wc]
+path = ".."
+
+# Its own workspace, so the compositor's build, tests and CI never pick it up.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "control_line"
+path = "fuzz_targets/control_line.rs"
+test = false
+doc = false
+bench = false
+
+# The same drm-fourcc the compositor builds with; see its Cargo.toml.
+[patch.crates-io]
+drm-fourcc = { git = "https://github.com/danielzfranklin/drm-fourcc-rs", rev = "1ad1a978a9aaa78ff0016cc7013787e4d1d68682" }
