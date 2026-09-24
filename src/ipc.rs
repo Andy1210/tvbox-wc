@@ -461,6 +461,21 @@ fn unterminated_too_long(buffer: &[u8]) -> bool {
     buffer.len() - start > MAX_LINE
 }
 
+/// The error answer for a line that did not decode as a request. The id is read
+/// on its own, so a well-formed object naming an unknown request, or carrying a
+/// bad argument, still answers under its own id and a pipelining client can tell
+/// which of its requests failed.
+fn undecodable_reply(line: &[u8], error: &str) -> String {
+    let id = serde_json::from_slice::<serde_json::Value>(line)
+        .ok()
+        .and_then(|value| value.get("id").and_then(serde_json::Value::as_u64));
+    encode(&Response {
+        id,
+        ok: None,
+        error: Some(error),
+    })
+}
+
 fn handle_line(state: &mut Tvbox, line: &[u8]) -> String {
     if line.iter().all(u8::is_ascii_whitespace) {
         return String::new();
@@ -468,13 +483,7 @@ fn handle_line(state: &mut Tvbox, line: &[u8]) -> String {
 
     let envelope: Envelope = match serde_json::from_slice(line) {
         Ok(envelope) => envelope,
-        Err(err) => {
-            return encode(&Response {
-                id: None,
-                ok: None,
-                error: Some(&err.to_string()),
-            });
-        }
+        Err(err) => return undecodable_reply(line, &err.to_string()),
     };
 
     let id = envelope.id;
@@ -652,6 +661,21 @@ fn send(mut stream: &UnixStream, reply: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_undecodable_request_answers_under_its_own_id() {
+        let reply = |line: &str| -> serde_json::Value {
+            serde_json::from_str(&undecodable_reply(line.as_bytes(), "bad")).unwrap()
+        };
+        assert_eq!(reply(r#"{"id":3,"request":"nonsense"}"#)["id"], 3);
+        assert_eq!(
+            reply(r#"{"id":7,"request":"set_mode","w":"wide"}"#)["id"],
+            7
+        );
+        assert!(reply(r#"{"id":"x","request":"nonsense"}"#)["id"].is_null());
+        assert!(reply("not json").get("id").unwrap().is_null());
+        assert_eq!(reply("not json")["error"], "bad");
+    }
 
     #[test]
     fn pipelined_requests_past_the_cap_are_left_for_the_next_turn() {
