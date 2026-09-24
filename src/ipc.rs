@@ -15,13 +15,18 @@
 //! ```
 //!
 //! The socket is owned by the session user and lives in a directory only that user
-//! can reach, which is the same protection mpv's control socket has. Anything that
-//! could reach this socket can already reach the compositor's Wayland socket.
+//! can reach, which is the same protection mpv's control socket has, and a
+//! connection from any other uid is refused. A sandboxed app (Flatpak) gets a
+//! private runtime directory with only the Wayland socket in it, so it cannot reach
+//! this one at all; an unsandboxed program running as the session user can, just as
+//! it can reach every other socket that user owns.
 
+use std::cell::RefCell;
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
@@ -190,6 +195,14 @@ struct Envelope {
 /// which is the compositor.
 const MAX_LINE: usize = 64 * 1024;
 
+/// How much one connection is read, and how many of its requests are answered, per
+/// turn of the event loop. The source is level-triggered, so whatever is left is
+/// picked up on the next turn - after the frames, the input and every other client
+/// have had theirs. Without a bound a peer that writes as fast as it can would keep
+/// the loop in this callback and freeze the picture and the remote.
+const MAX_READ_PER_TURN: usize = 256 * 1024;
+const MAX_REQUESTS_PER_TURN: usize = 64;
+
 /// Start listening, and return the path so it can be handed to children.
 pub fn listen(loop_handle: &LoopHandle<'static, Tvbox>, path: PathBuf) -> Result<PathBuf> {
     // A socket left behind by a compositor that did not shut down cleanly would
@@ -234,6 +247,15 @@ pub fn listen(loop_handle: &LoopHandle<'static, Tvbox>, path: PathBuf) -> Result
 }
 
 fn accept(stream: UnixStream) {
+    // The socket's mode already says this, but not when it landed in the /tmp
+    // fallback before the permission was set, and a peer's uid costs one call.
+    match peer_uid(&stream) {
+        Some(uid) if uid == unsafe { libc::geteuid() } => {}
+        uid => {
+            warn!(?uid, "refused a control connection from another user");
+            return;
+        }
+    }
     if let Err(err) = stream.set_nonblocking(true) {
         warn!(?err, "failed to configure a control connection");
         return;
@@ -245,8 +267,102 @@ fn accept(stream: UnixStream) {
     CONNECTIONS.with(|pending| pending.borrow_mut().push(stream));
 }
 
+/// The uid of the process at the other end of a unix socket.
+fn peer_uid(stream: &UnixStream) -> Option<libc::uid_t> {
+    use std::os::unix::io::AsRawFd as _;
+    let mut cred = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    // Safety: SO_PEERCRED writes a ucred into a buffer of exactly that size.
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut cred as *mut libc::ucred).cast(),
+            &mut len,
+        )
+    };
+    (result == 0).then_some(cred.uid)
+}
+
 thread_local! {
     static CONNECTIONS: std::cell::RefCell<Vec<UnixStream>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// One control connection: what has been read and not answered yet, and a handle
+/// to write the answers with. Shared between the socket's source and the idle
+/// callback that answers what one turn left over.
+struct Connection {
+    buffer: Vec<u8>,
+    writer: UnixStream,
+    /// A write failed; the source removes itself the next time it runs.
+    dead: bool,
+    /// An idle callback is already queued to answer the rest.
+    scheduled: bool,
+}
+
+/// Answer up to `max` complete lines from the front of `buffer`, and say whether
+/// complete lines are still waiting. `answer` returns false when the reply could
+/// not be sent, which stops the drain.
+fn answer_lines(
+    buffer: &mut Vec<u8>,
+    max: usize,
+    mut answer: impl FnMut(&[u8]) -> bool,
+) -> Result<bool, ()> {
+    let mut answered = 0;
+    while answered < max {
+        let Some(end) = buffer.iter().position(|byte| *byte == b'\n') else {
+            return Ok(false);
+        };
+        let line: Vec<u8> = buffer.drain(..=end).collect();
+        answered += 1;
+        if !answer(&line[..line.len() - 1]) {
+            return Err(());
+        }
+    }
+    Ok(buffer.contains(&b'\n'))
+}
+
+/// Answer one turn's worth of a connection's requests, and queue an idle callback
+/// for the rest. The socket is level-triggered on READ, so lines that are already
+/// buffered would otherwise wait for the peer to send something else.
+fn drain(state: &mut Tvbox, connection: &Rc<RefCell<Connection>>) {
+    let more = {
+        let mut conn = connection.borrow_mut();
+        let Connection { buffer, writer, .. } = &mut *conn;
+        let result = answer_lines(buffer, MAX_REQUESTS_PER_TURN, |line| {
+            let reply = handle_line(state, line);
+            match send(writer, &reply) {
+                Ok(()) => true,
+                Err(err) => {
+                    warn!(?err, "failed to answer a control request");
+                    false
+                }
+            }
+        });
+        match result {
+            Ok(more) => more,
+            Err(()) => {
+                conn.dead = true;
+                false
+            }
+        }
+    };
+    let mut conn = connection.borrow_mut();
+    if more && !conn.scheduled {
+        conn.scheduled = true;
+        let connection = connection.clone();
+        state.loop_handle.insert_idle(move |state| {
+            connection.borrow_mut().scheduled = false;
+            if !connection.borrow().dead {
+                drain(state, &connection);
+            }
+        });
+    }
 }
 
 /// Register any connection accepted since the last call.
@@ -257,42 +373,73 @@ pub fn register_pending(state: &mut Tvbox) {
     let pending: Vec<UnixStream> =
         CONNECTIONS.with(|pending| pending.borrow_mut().drain(..).collect());
     for stream in pending {
-        let mut buffer = Vec::new();
+        let writer = match stream.try_clone() {
+            Ok(writer) => writer,
+            Err(err) => {
+                warn!(?err, "failed to register a control connection");
+                continue;
+            }
+        };
+        let connection = Rc::new(RefCell::new(Connection {
+            buffer: Vec::new(),
+            writer,
+            dead: false,
+            scheduled: false,
+        }));
         let inserted = state.loop_handle.insert_source(
             Generic::new(stream, Interest::READ, Mode::Level),
             move |_, stream, state: &mut Tvbox| {
+                if connection.borrow().dead {
+                    return Ok(PostAction::Remove);
+                }
                 let mut chunk = [0u8; 4096];
-                loop {
-                    match (&**stream).read(&mut chunk) {
-                        Ok(0) => return Ok(PostAction::Remove),
-                        Ok(n) => {
-                            buffer.extend_from_slice(&chunk[..n]);
-                            if buffer.len() > MAX_LINE && !buffer.contains(&b'\n') {
-                                warn!(
-                                    bytes = buffer.len(),
-                                    "a control connection sent no newline - dropping it"
-                                );
+                let mut read = 0;
+                let mut closed = false;
+                {
+                    let mut conn = connection.borrow_mut();
+                    // Only while there is room: the requests already in the buffer
+                    // are answered first, so a peer cannot fill it faster than it is
+                    // drained.
+                    while read < MAX_READ_PER_TURN && conn.buffer.len() <= MAX_LINE {
+                        match (&**stream).read(&mut chunk) {
+                            Ok(0) => {
+                                closed = true;
+                                break;
+                            }
+                            Ok(n) => {
+                                read += n;
+                                conn.buffer.extend_from_slice(&chunk[..n]);
+                            }
+                            Err(err) if err.kind() == ErrorKind::WouldBlock => break,
+                            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+                            Err(err) => {
+                                warn!(?err, "control connection failed");
                                 return Ok(PostAction::Remove);
                             }
                         }
-                        Err(err) if err.kind() == ErrorKind::WouldBlock => break,
-                        Err(err) if err.kind() == ErrorKind::Interrupted => continue,
-                        Err(err) => {
-                            warn!(?err, "control connection failed");
-                            return Ok(PostAction::Remove);
-                        }
                     }
                 }
 
-                while let Some(end) = buffer.iter().position(|byte| *byte == b'\n') {
-                    let line: Vec<u8> = buffer.drain(..=end).collect();
-                    let reply = handle_line(state, &line[..line.len() - 1]);
-                    if let Err(err) = send(stream, &reply) {
-                        warn!(?err, "failed to answer a control request");
-                        return Ok(PostAction::Remove);
-                    }
+                // Lines an idle callback is about to answer are left to it, so the
+                // two cannot answer out of order.
+                if !connection.borrow().scheduled {
+                    drain(state, &connection);
                 }
 
+                let conn = connection.borrow();
+                if conn.dead {
+                    return Ok(PostAction::Remove);
+                }
+                if unterminated_too_long(&conn.buffer) {
+                    warn!(
+                        bytes = conn.buffer.len(),
+                        "a control connection sent an over-long line - dropping it"
+                    );
+                    return Ok(PostAction::Remove);
+                }
+                if closed && !conn.buffer.contains(&b'\n') {
+                    return Ok(PostAction::Remove);
+                }
                 Ok(PostAction::Continue)
             },
         );
@@ -302,6 +449,33 @@ pub fn register_pending(state: &mut Tvbox) {
     }
 }
 
+/// Whether the part of the buffer after its last complete line is already longer
+/// than any request may be. Counted after the LAST newline: a peer that sends one
+/// short line and then an endless one must not get past the cap on the strength of
+/// the newline that is already in the buffer.
+fn unterminated_too_long(buffer: &[u8]) -> bool {
+    let start = buffer
+        .iter()
+        .rposition(|byte| *byte == b'\n')
+        .map_or(0, |at| at + 1);
+    buffer.len() - start > MAX_LINE
+}
+
+/// The error answer for a line that did not decode as a request. The id is read
+/// on its own, so a well-formed object naming an unknown request, or carrying a
+/// bad argument, still answers under its own id and a pipelining client can tell
+/// which of its requests failed.
+fn undecodable_reply(line: &[u8], error: &str) -> String {
+    let id = serde_json::from_slice::<serde_json::Value>(line)
+        .ok()
+        .and_then(|value| value.get("id").and_then(serde_json::Value::as_u64));
+    encode(&Response {
+        id,
+        ok: None,
+        error: Some(error),
+    })
+}
+
 fn handle_line(state: &mut Tvbox, line: &[u8]) -> String {
     if line.iter().all(u8::is_ascii_whitespace) {
         return String::new();
@@ -309,13 +483,7 @@ fn handle_line(state: &mut Tvbox, line: &[u8]) -> String {
 
     let envelope: Envelope = match serde_json::from_slice(line) {
         Ok(envelope) => envelope,
-        Err(err) => {
-            return encode(&Response {
-                id: None,
-                ok: None,
-                error: Some(&err.to_string()),
-            });
-        }
+        Err(err) => return undecodable_reply(line, &err.to_string()),
     };
 
     let id = envelope.id;
@@ -406,6 +574,13 @@ fn dispatch(state: &mut Tvbox, request: Request) -> Result<serde_json::Value> {
             h,
         } => {
             let key = match (app_id, title) {
+                // Every window of the shell shares its app id, the launcher included,
+                // so a placement by it would move the whole UI - off screen, or into
+                // a corner - and nothing the shell does needs that. Its windows are
+                // placed one at a time, by title.
+                (Some(app_id), None) if app_id == crate::stacking::shell_app_id() => {
+                    anyhow::bail!("the shell's windows are placed by title, not by app id")
+                }
                 (Some(app_id), None) => crate::state::PlaceKey::AppId(app_id),
                 (None, Some(title)) => crate::state::PlaceKey::Title(title),
                 _ => anyhow::bail!(
@@ -481,4 +656,91 @@ fn send(mut stream: &UnixStream, reply: &str) -> std::io::Result<()> {
         ErrorKind::WouldBlock,
         "the client stopped reading",
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_undecodable_request_answers_under_its_own_id() {
+        let reply = |line: &str| -> serde_json::Value {
+            serde_json::from_str(&undecodable_reply(line.as_bytes(), "bad")).unwrap()
+        };
+        assert_eq!(reply(r#"{"id":3,"request":"nonsense"}"#)["id"], 3);
+        assert_eq!(
+            reply(r#"{"id":7,"request":"set_mode","w":"wide"}"#)["id"],
+            7
+        );
+        assert!(reply(r#"{"id":"x","request":"nonsense"}"#)["id"].is_null());
+        assert!(reply("not json").get("id").unwrap().is_null());
+        assert_eq!(reply("not json")["error"], "bad");
+    }
+
+    #[test]
+    fn pipelined_requests_past_the_cap_are_left_for_the_next_turn() {
+        let mut buffer: Vec<u8> = (0..100)
+            .flat_map(|i| format!("{i}\n").into_bytes())
+            .collect();
+        let mut seen = Vec::new();
+        let more = answer_lines(&mut buffer, 64, |line| {
+            seen.push(String::from_utf8(line.to_vec()).unwrap());
+            true
+        });
+        assert_eq!(more, Ok(true));
+        assert_eq!(seen.len(), 64);
+        let more = answer_lines(&mut buffer, 64, |line| {
+            seen.push(String::from_utf8(line.to_vec()).unwrap());
+            true
+        });
+        assert_eq!(more, Ok(false));
+        assert_eq!(seen.len(), 100);
+        assert_eq!(seen[99], "99");
+        assert!(buffer.is_empty());
+    }
+
+    #[test]
+    fn a_partial_line_is_kept_and_does_not_count_as_waiting() {
+        let mut buffer = b"a\nb".to_vec();
+        let more = answer_lines(&mut buffer, 64, |_| true);
+        assert_eq!(more, Ok(false));
+        assert_eq!(buffer, b"b");
+    }
+
+    #[test]
+    fn a_failed_answer_stops_the_drain() {
+        let mut buffer = b"a\nb\n".to_vec();
+        let mut calls = 0;
+        let result = answer_lines(&mut buffer, 64, |_| {
+            calls += 1;
+            false
+        });
+        assert_eq!(result, Err(()));
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn a_short_line_does_not_let_an_endless_one_through() {
+        let mut buffer = b"{}\n".to_vec();
+        buffer.extend(std::iter::repeat_n(b'x', MAX_LINE));
+        assert!(!unterminated_too_long(&buffer));
+        buffer.push(b'x');
+        assert!(unterminated_too_long(&buffer));
+    }
+
+    #[test]
+    fn complete_lines_do_not_count_against_the_cap() {
+        let mut buffer = Vec::new();
+        for _ in 0..=(MAX_LINE / 4) {
+            buffer.extend_from_slice(b"{}\n\n");
+        }
+        assert!(buffer.len() > MAX_LINE);
+        assert!(!unterminated_too_long(&buffer));
+    }
+
+    #[test]
+    fn the_peer_uid_is_ours_on_a_socketpair() {
+        let (a, _b) = UnixStream::pair().unwrap();
+        assert_eq!(peer_uid(&a), Some(unsafe { libc::geteuid() }));
+    }
 }
